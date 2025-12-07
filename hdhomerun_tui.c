@@ -1418,7 +1418,7 @@ int main_loop() {
 
         int ch = getch();
 
-        if (ch == KEY_MOUSE) {
+        /*if (ch == KEY_MOUSE) {
             if (mouse_scroll_enabled) {
                 MEVENT event;
                 if (getmouse(&event) == OK) {
@@ -1430,7 +1430,7 @@ int main_loop() {
                 }
             }
             continue; // Always continue to avoid switch statement processing mouse
-        }
+        }*/
 
         if (persistent_message && ch != ERR) {
             free(persistent_message);
@@ -1875,7 +1875,7 @@ int main() {
     // to differentiate between a real KEY_UP/DOWN from the keyboard and a
     // scroll event from the mouse, which we will ignore. Clicks and drags
     // for selection will be handled by the terminal as normal.
-    mousemask(BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
+    //mousemask(BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
 
     init_pair(1, COLOR_RED, COLOR_BLACK);
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
