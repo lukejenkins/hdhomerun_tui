@@ -907,12 +907,13 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
         if (parse_status_value_l1(raw_status_str, "ss=") != -999) has_db_values = true;
     }
 
+    char *fresh_version_str;
     long version_num = 0;
-    if (version_str) {
+    if (hdhomerun_device_get_var(hd, "/sys/version", &fresh_version_str, NULL) > 0) {
         char numeric_version_str[16] = {0};
         int i = 0;
-        while(version_str[i] && isdigit((unsigned char)version_str[i]) && i < 15) {
-            numeric_version_str[i] = version_str[i];
+        while(fresh_version_str[i] && isdigit((unsigned char)fresh_version_str[i]) && i < 15) {
+            numeric_version_str[i] = fresh_version_str[i];
             i++;
         }
         version_num = atol(numeric_version_str);

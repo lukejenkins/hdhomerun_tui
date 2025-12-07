@@ -74,7 +74,7 @@
 #define MAX_MAPS 20 // Maximum number of channel maps supported
 #define MAX_PROGRAMS 128
 
-static const char* TUI_VERSION = "0.8.4";
+static const char* TUI_VERSION = "0.8.5";
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
