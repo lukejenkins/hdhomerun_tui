@@ -74,7 +74,7 @@
 #define MAX_MAPS 20 // Maximum number of channel maps supported
 #define MAX_PROGRAMS 128
 
-static const char* TUI_VERSION = "0.8.5";
+static const char* TUI_VERSION = "0.8.6";
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
@@ -642,7 +642,7 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
     }
 
     // 2. Send HTTP GET request
-    const char *path_start = strstr(url, "/auto/");
+    const char *path_start = strstr(url, "/tuner");
     if (!path_start) {
         print_line_in_box(win, LINES - 3, 2, "Error: Invalid URL for request."); wrefresh(win); sleep(2);
         close(sock);
@@ -811,7 +811,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
         const int max_save_attempts = 5;
         
         while(1) { // Loop to allow for auto-restarting
-            const char *format = is_pcap ? "ipv4-pcap" : "dbg";
+            const char *format = is_pcap ? "alp-pcap" : "dbg";
             const char *ext = is_pcap ? ".pcap" : ".dbg";
             
             char plp_str[128] = {0};
@@ -866,7 +866,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             sprintf(filename, "rf%u-bsid%ld-%s-%s%s", rf_channel, id_val, plp_str, time_str, ext);
             
             char url[256];
-            sprintf(url, "http://%s:5004/auto/ch%u%s?format=%s", tuner_info->ip_str, rf_channel, plp_str, format);
+            sprintf(url, "http://%s:5004/tuner%d/ch%u%s?format=%s", tuner_info->ip_str, tuner_info->tuner_index, rf_channel, plp_str, format);
             
             bool aborted = false;
             bool error_detected = false;
