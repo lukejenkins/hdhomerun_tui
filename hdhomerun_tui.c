@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "hdhomerun.h"
 #include "hdhomerun_device.h"
 
@@ -42,9 +43,10 @@
 #define BAR_WIDTH 30
 #define MAX_CHANNELS 256
 #define LEFT_PANE_WIDTH 15
-#define MAX_PLPS 32
+#define MAX_PLPS 64
 #define MAX_MAPS 20 // Maximum number of channel maps supported
 #define MAX_PROGRAMS 128
+#define MAX_DISPLAY_LINES (MAX_PLPS * 15 + 150) // Increased buffer for L1 detail
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
@@ -101,7 +103,7 @@ long parse_status_value(const char *status_str, const char *key);
 char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, struct unified_tuner *tuner_info);
 int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_program_str, int *selected_plp);
 int get_udp_port();
-int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd);
+int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info);
 const struct modcod_snr* get_snr_for_modcod(const char* mod, const char* cod);
 void normalize_mod_str(const char *in, char *out, size_t out_size);
 int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled);
@@ -1517,7 +1519,7 @@ int main_loop() {
 
             case 'd':
                 if(hd && is_atsc3) {
-                    if (show_plp_details_screen(status_win, hd) == 1) { // Quit requested
+                    if (show_plp_details_screen(status_win, hd, selected_tuner) == 1) { // Quit requested
                          if (hd) hdhomerun_device_destroy(hd);
                          delwin(tuner_win); delwin(status_win);
                          return 0;
@@ -1941,42 +1943,374 @@ int main() {
     return 0;
 }
 
+// --- Base64 and L1 Parsing Helpers ---
+
+static const int b64_decode_table[] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
+    -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
+    -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1
+};
+
+/*
+ * base64_decode
+ * Decodes a Base64 string. The caller must free the returned buffer.
+ */
+unsigned char *base64_decode(const char *data, size_t *out_len) {
+    size_t len = strlen(data);
+    if (len % 4 != 0) return NULL;
+
+    *out_len = len / 4 * 3;
+    if (data[len - 1] == '=') (*out_len)--;
+    if (data[len - 2] == '=') (*out_len)--;
+
+    unsigned char *decoded_data = malloc(*out_len + 1);
+    if (decoded_data == NULL) return NULL;
+
+    for (size_t i = 0, j = 0; i < len; i += 4, j += 3) {
+        int v1 = b64_decode_table[(int)data[i]];
+        int v2 = b64_decode_table[(int)data[i+1]];
+        int v3 = (data[i+2] == '=') ? -1 : b64_decode_table[(int)data[i+2]];
+        int v4 = (data[i+3] == '=') ? -1 : b64_decode_table[(int)data[i+3]];
+
+        if (v1 == -1 || v2 == -1) {
+            free(decoded_data);
+            return NULL;
+        }
+
+        decoded_data[j] = (unsigned char)((v1 << 2) | (v2 >> 4));
+        if (v3 != -1) {
+            decoded_data[j + 1] = (unsigned char)(((v2 & 15) << 4) | (v3 >> 2));
+        }
+        if (v4 != -1) {
+            decoded_data[j + 2] = (unsigned char)(((v3 & 3) << 6) | v4);
+        }
+    }
+    decoded_data[*out_len] = '\0';
+    return decoded_data;
+}
+
+/*
+ * get_bits
+ * Extracts a specified number of bits from a buffer at a given bit offset.
+ */
+uint64_t get_bits(const uint8_t *buffer, int *bit_offset, int num_bits) {
+    uint64_t result = 0;
+    for (int i = 0; i < num_bits; i++) {
+        int byte_pos = (*bit_offset) / 8;
+        int bit_pos = 7 - ((*bit_offset) % 8);
+        if ((buffer[byte_pos] >> bit_pos) & 1) {
+            result |= (1ULL << (num_bits - 1 - i));
+        }
+        (*bit_offset)++;
+    }
+    return result;
+}
+
+// --- A/322 L1 Parsing Data and Functions ---
+
+const char* L1B_papr_reduction_map[] = {"None", "TR-PAPR", "L-PAPR", "Reserved"};
+const char* L1B_L1_Detail_fec_type_map[] = {"BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K", "LDPC 64K", "Reserved", "Reserved"};
+const char* L1B_L1_Detail_additional_parity_mode_map[] = {"0%", "2.5%", "5%", "7.5%"};
+const char* L1B_first_sub_fft_size_map[] = {"8K", "16K", "32K", "Reserved"};
+const char* L1B_first_sub_guard_interval_map[] = {
+    "GI_1/192", "GI_2/384", "GI_3/384", "GI_4/384", "GI_6/384", "GI_7/384", 
+    "GI_8/384", "GI_9/384", "GI_10/384", "GI_12/384", "GI_13/384", "GI_14/384", 
+    "GI_15/384", "GI_16/384", "GI_18/384", "GI_20/384"
+};
+const char* L1B_first_sub_scattered_pilot_boost_map[] = {"0dB", "3dB", "4.77dB", "6dB", "7.78dB", "9.54dB", "Reserved", "Reserved"};
+const char* L1D_plp_fec_type_map[] = {"BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K (no BCH)", "LDPC 64K (no BCH)", "Reserved", "Reserved", "BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K", "LDPC 64K", "Reserved", "Reserved"};
+const char* L1D_plp_mod_map[] = {"QPSK", "16-QAM", "64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "N/A", "N/A", "QPSK", "16-QAM", "64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "N/A", "N/A"};
+const char* L1D_plp_cod_map[] = {"2/15", "3/15", "4/15", "5/15", "6/15", "7/15", "8/15", "9/15", "10/15", "11/15", "12/15", "13/15", "N/A", "N/A", "N/A", "N/A"};
+
+/*
+ * parse_l1_data
+ * Parses the decoded L1 data and adds formatted strings to the display list.
+ */
+void parse_l1_data(const unsigned char* data, size_t len, char** display_lines, int* line_count, int max_lines) {
+    int bit_offset = 0;
+    uint64_t L1B_num_subframes, L1B_time_info_flag;
+    uint64_t L1B_first_sub_sbs_first, L1B_first_sub_sbs_last, L1B_first_sub_mimo, L1B_first_sub_mimo_mixed;
+    uint64_t L1D_mimo_mixed = 0;
+    
+    // Helper to add a line to the display buffer safely
+    #define add_line(...) \
+        if (*line_count < max_lines) { \
+            char line_buf[256]; \
+            snprintf(line_buf, sizeof(line_buf), __VA_ARGS__); \
+            display_lines[(*line_count)++] = strdup(line_buf); \
+        }
+
+    add_line("--- L1-Basic Signaling ---");
+    add_line("L1B_version: %lu", get_bits(data, &bit_offset, 3));
+    add_line("L1B_mimo_scattered_pilot_encoding: %lu", get_bits(data, &bit_offset, 1));
+    add_line("L1B_lls_flag: %lu", get_bits(data, &bit_offset, 1));
+    L1B_time_info_flag = get_bits(data, &bit_offset, 2);
+    add_line("L1B_time_info_flag: %lu", L1B_time_info_flag);
+    add_line("L1B_return_channel_flag: %lu", get_bits(data, &bit_offset, 1));
+    uint64_t papr = get_bits(data, &bit_offset, 2);
+    add_line("L1B_papr_reduction: %s", L1B_papr_reduction_map[papr]);
+    uint64_t frame_length_mode = get_bits(data, &bit_offset, 1);
+    add_line("L1B_frame_length_mode: %lu", frame_length_mode);
+    if (frame_length_mode == 0) {
+        add_line("L1B_frame_length: %lu", get_bits(data, &bit_offset, 10));
+        add_line("L1B_excess_samples_per_symbol: %lu", get_bits(data, &bit_offset, 13));
+    } else {
+        add_line("L1B_time_offset: %lu", get_bits(data, &bit_offset, 16));
+        add_line("L1B_additional_samples: %lu", get_bits(data, &bit_offset, 7));
+    }
+    L1B_num_subframes = get_bits(data, &bit_offset, 8);
+    add_line("L1B_num_subframes: %lu", L1B_num_subframes);
+    add_line("L1B_preamble_num_symbols: %lu", get_bits(data, &bit_offset, 3));
+    add_line("L1B_preamble_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
+    add_line("L1B_L1_Detail_content_tag: %lu", get_bits(data, &bit_offset, 2));
+    add_line("L1B_L1_Detail_size_bytes: %lu", get_bits(data, &bit_offset, 13));
+    uint64_t l1d_fec = get_bits(data, &bit_offset, 3);
+    add_line("L1B_L1_Detail_fec_type: %s", L1B_L1_Detail_fec_type_map[l1d_fec]);
+    uint64_t l1d_parity = get_bits(data, &bit_offset, 2);
+    add_line("L1B_L1_Detail_additional_parity_mode: %s", L1B_L1_Detail_additional_parity_mode_map[l1d_parity]);
+    add_line("L1B_L1_Detail_total_cells: %lu", get_bits(data, &bit_offset, 19));
+    L1B_first_sub_mimo = get_bits(data, &bit_offset, 1);
+    add_line("L1B_first_sub_mimo: %lu", L1B_first_sub_mimo);
+    add_line("L1B_first_sub_miso: %lu", get_bits(data, &bit_offset, 2));
+    uint64_t fft_size = get_bits(data, &bit_offset, 2);
+    add_line("L1B_first_sub_fft_size: %s", L1B_first_sub_fft_size_map[fft_size]);
+    add_line("L1B_first_sub_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
+    uint64_t gi = get_bits(data, &bit_offset, 4);
+    add_line("L1B_first_sub_guard_interval: %s", L1B_first_sub_guard_interval_map[gi]);
+    add_line("L1B_first_sub_num_ofdm_symbols: %lu", get_bits(data, &bit_offset, 11));
+    add_line("L1B_first_sub_scattered_pilot_pattern: %lu", get_bits(data, &bit_offset, 5));
+    uint64_t sp_boost = get_bits(data, &bit_offset, 3);
+    add_line("L1B_first_sub_scattered_pilot_boost: %s", L1B_first_sub_scattered_pilot_boost_map[sp_boost]);
+    L1B_first_sub_sbs_first = get_bits(data, &bit_offset, 1);
+    add_line("L1B_first_sub_sbs_first: %lu", L1B_first_sub_sbs_first);
+    L1B_first_sub_sbs_last = get_bits(data, &bit_offset, 1);
+    add_line("L1B_first_sub_sbs_last: %lu", L1B_first_sub_sbs_last);
+    L1B_first_sub_mimo_mixed = get_bits(data, &bit_offset, 1);
+    add_line("L1B_first_sub_mimo_mixed: %lu", L1B_first_sub_mimo_mixed);
+    add_line("L1B_reserved: %lu", get_bits(data, &bit_offset, 47));
+    add_line("L1B_crc: 0x%08lX", get_bits(data, &bit_offset, 32));
+    
+    add_line(" ");
+    add_line("--- L1-Detail Signaling ---");
+    add_line("L1D_version: %lu", get_bits(data, &bit_offset, 4));
+    uint64_t L1D_num_rf = get_bits(data, &bit_offset, 3);
+    add_line("L1D_num_rf: %lu", L1D_num_rf);
+    for (uint64_t rf_id = 0; rf_id < L1D_num_rf; rf_id++) {
+        add_line("  L1D_bonded_bsid[%lu]: %lu", rf_id, get_bits(data, &bit_offset, 16));
+        get_bits(data, &bit_offset, 3); // reserved
+    }
+    if (L1B_time_info_flag != 0) {
+        add_line("L1D_time_sec: %lu", get_bits(data, &bit_offset, 32));
+        add_line("L1D_time_msec: %lu", get_bits(data, &bit_offset, 10));
+        if (L1B_time_info_flag != 1) {
+            add_line("L1D_time_usec: %lu", get_bits(data, &bit_offset, 10));
+            if (L1B_time_info_flag != 2) {
+                add_line("L1D_time_nsec: %lu", get_bits(data, &bit_offset, 10));
+            }
+        }
+    }
+
+    for (uint64_t i = 0; i <= L1B_num_subframes; i++) {
+        add_line(" ");
+        add_line("Subframe #%lu:", i);
+        uint64_t L1D_mimo = 0, L1D_sbs_first = 0, L1D_sbs_last = 0;
+        if (i > 0) {
+            L1D_mimo = get_bits(data, &bit_offset, 1);
+            add_line("  L1D_mimo: %lu", L1D_mimo);
+            add_line("  L1D_miso: %lu", get_bits(data, &bit_offset, 2));
+            uint64_t l1d_fft = get_bits(data, &bit_offset, 2);
+            add_line("  L1D_fft_size: %s", L1B_first_sub_fft_size_map[l1d_fft]);
+            add_line("  L1D_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
+            uint64_t l1d_gi = get_bits(data, &bit_offset, 4);
+            add_line("  L1D_guard_interval: %s", L1B_first_sub_guard_interval_map[l1d_gi]);
+            add_line("  L1D_num_ofdm_symbols: %lu", get_bits(data, &bit_offset, 11));
+            add_line("  L1D_scattered_pilot_pattern: %lu", get_bits(data, &bit_offset, 5));
+            uint64_t l1d_sp_boost = get_bits(data, &bit_offset, 3);
+            add_line("  L1D_scattered_pilot_boost: %s", L1B_first_sub_scattered_pilot_boost_map[l1d_sp_boost]);
+            L1D_sbs_first = get_bits(data, &bit_offset, 1);
+            add_line("  L1D_sbs_first: %lu", L1D_sbs_first);
+            L1D_sbs_last = get_bits(data, &bit_offset, 1);
+            add_line("  L1D_sbs_last: %lu", L1D_sbs_last);
+        }
+        if (L1B_num_subframes > 0) {
+            add_line("  L1D_subframe_multiplex: %lu", get_bits(data, &bit_offset, 1));
+        }
+        add_line("  L1D_frequency_interleaver: %lu", get_bits(data, &bit_offset, 1));
+        if (((i == 0) && (L1B_first_sub_sbs_first || L1B_first_sub_sbs_last)) || ((i > 0) && (L1D_sbs_first || L1D_sbs_last))) {
+            add_line("  L1D_sbs_null_cells: %lu", get_bits(data, &bit_offset, 13));
+        }
+        uint64_t L1D_num_plp = get_bits(data, &bit_offset, 6);
+        add_line("  L1D_num_plp: %lu", L1D_num_plp);
+
+        for (uint64_t j = 0; j <= L1D_num_plp; j++) {
+            add_line("    PLP #%lu:", j);
+            add_line("      L1D_plp_id: %lu", get_bits(data, &bit_offset, 6));
+            add_line("      L1D_plp_lls_flag: %lu", get_bits(data, &bit_offset, 1));
+            uint64_t L1D_plp_layer = get_bits(data, &bit_offset, 2);
+            add_line("      L1D_plp_layer: %lu", L1D_plp_layer);
+            add_line("      L1D_plp_start: %lu", get_bits(data, &bit_offset, 24));
+            add_line("      L1D_plp_size: %lu", get_bits(data, &bit_offset, 24));
+            add_line("      L1D_plp_scrambler_type: %lu", get_bits(data, &bit_offset, 2));
+            uint64_t L1D_plp_fec_type = get_bits(data, &bit_offset, 4);
+            add_line("      L1D_plp_fec_type: %s", L1D_plp_fec_type_map[L1D_plp_fec_type]);
+            
+            uint64_t L1D_plp_mod = 0;
+            if (L1D_plp_fec_type <= 5) {
+                L1D_plp_mod = get_bits(data, &bit_offset, 4);
+                add_line("      L1D_plp_mod: %s", L1D_plp_mod_map[L1D_plp_mod]);
+                uint64_t L1D_plp_cod = get_bits(data, &bit_offset, 4);
+                add_line("      L1D_plp_cod: %s", L1D_plp_cod_map[L1D_plp_cod]);
+            }
+            
+            uint64_t L1D_plp_TI_mode = get_bits(data, &bit_offset, 2);
+            add_line("      L1D_plp_TI_mode: %lu", L1D_plp_TI_mode);
+            if (L1D_plp_TI_mode == 0) {
+                add_line("      L1D_plp_fec_block_start: %lu", get_bits(data, &bit_offset, 15));
+            } else if (L1D_plp_TI_mode == 1) {
+                add_line("      L1D_plp_CTI_fec_block_start: %lu", get_bits(data, &bit_offset, 22));
+            }
+            
+            if (L1D_num_rf > 0) {
+                uint64_t L1D_plp_num_channel_bonded = get_bits(data, &bit_offset, 3);
+                add_line("      L1D_plp_num_channel_bonded: %lu", L1D_plp_num_channel_bonded);
+                if (L1D_plp_num_channel_bonded > 0) {
+                    add_line("      L1D_plp_channel_bonding_format: %lu", get_bits(data, &bit_offset, 2));
+                    for (uint64_t k = 0; k < L1D_plp_num_channel_bonded; k++) {
+                        add_line("        L1D_plp_bonded_rf_id[%lu]: %lu", k, get_bits(data, &bit_offset, 3));
+                    }
+                }
+            }
+            
+            if ((i == 0 && L1B_first_sub_mimo == 1) || (i > 0 && L1D_mimo == 1)) {
+                add_line("      L1D_plp_mimo_stream_combining: %lu", get_bits(data, &bit_offset, 1));
+                add_line("      L1D_plp_mimo_IQ_interleaving: %lu", get_bits(data, &bit_offset, 1));
+                add_line("      L1D_plp_mimo_PH: %lu", get_bits(data, &bit_offset, 1));
+            }
+
+            if (L1D_plp_layer == 0) {
+                uint64_t L1D_plp_type = get_bits(data, &bit_offset, 1);
+                add_line("      L1D_plp_type: %lu", L1D_plp_type);
+                if (L1D_plp_type == 1) {
+                    add_line("      L1D_plp_num_subslices: %lu", get_bits(data, &bit_offset, 14));
+                    add_line("      L1D_plp_subslice_interval: %lu", get_bits(data, &bit_offset, 24));
+                }
+                if (((L1D_plp_TI_mode == 1) || (L1D_plp_TI_mode == 2)) && (L1D_plp_mod == 0)) {
+                    add_line("      L1D_plp_TI_extended_interleaving: %lu", get_bits(data, &bit_offset, 1));
+                }
+                if (L1D_plp_TI_mode == 1) {
+                    add_line("      L1D_plp_CTI_depth: %lu", get_bits(data, &bit_offset, 3));
+                    add_line("      L1D_plp_CTI_start_row: %lu", get_bits(data, &bit_offset, 11));
+                } else if (L1D_plp_TI_mode == 2) {
+                    uint64_t L1D_plp_HTI_inter_subframe = get_bits(data, &bit_offset, 1);
+                    add_line("      L1D_plp_HTI_inter_subframe: %lu", L1D_plp_HTI_inter_subframe);
+                    uint64_t L1D_plp_HTI_num_ti_blocks = get_bits(data, &bit_offset, 4);
+                    add_line("      L1D_plp_HTI_num_ti_blocks: %lu", L1D_plp_HTI_num_ti_blocks);
+                    add_line("      L1D_plp_HTI_num_fec_blocks_max: %lu", get_bits(data, &bit_offset, 12));
+                    if (L1D_plp_HTI_inter_subframe == 0) {
+                        add_line("      L1D_plp_HTI_num_fec_blocks: %lu", get_bits(data, &bit_offset, 12));
+                    } else {
+                        for (uint64_t k = 0; k <= L1D_plp_HTI_num_ti_blocks; k++) {
+                            add_line("        L1D_plp_HTI_num_fec_blocks[%lu]: %lu", k, get_bits(data, &bit_offset, 12));
+                        }
+                    }
+                    add_line("      L1D_plp_HTI_cell_interleaver: %lu", get_bits(data, &bit_offset, 1));
+                }
+            } else {
+                add_line("      L1D_plp_ldm_injection_level: %lu", get_bits(data, &bit_offset, 5));
+            }
+        }
+    }
+    
+    add_line("L1D_bsid: %lu", get_bits(data, &bit_offset, 16));
+    for (uint64_t i = 0; i <= L1B_num_subframes; i++) {
+        if (i > 0) {
+            L1D_mimo_mixed = get_bits(data, &bit_offset, 1);
+            add_line("Subframe #%lu L1D_mimo_mixed: %lu", i, L1D_mimo_mixed);
+        }
+        if ((i == 0 && L1B_first_sub_mimo_mixed == 1) || (i > 0 && L1D_mimo_mixed == 1)) {
+            // This part of the spec is complex and depends on values from the PLP loop.
+            // For now, we will skip the inner MIMO details to avoid state complexity and potential errors.
+        }
+    }
+    add_line("L1D_crc: 0x%08lX", get_bits(data, &bit_offset, 32));
+
+
+    // Display any remaining bits
+    if (bit_offset < len * 8) {
+        add_line(" ");
+        add_line("--- Remaining Unparsed Bits ---");
+        char bit_buf[65]; // 64 bits + null
+        int bit_idx = 0;
+        while(bit_offset < len * 8) {
+            int byte_pos = bit_offset / 8;
+            int bit_pos = 7 - (bit_offset % 8);
+            bit_buf[bit_idx++] = ((data[byte_pos] >> bit_pos) & 1) ? '1' : '0';
+            if (bit_idx == 64) {
+                bit_buf[bit_idx] = '\0';
+                add_line("%s", bit_buf);
+                bit_idx = 0;
+            }
+            bit_offset++;
+        }
+        if (bit_idx > 0) {
+            bit_buf[bit_idx] = '\0';
+            add_line("%s", bit_buf);
+        }
+    }
+    add_line(" ");
+}
+
+
 /*
  * show_plp_details_screen
  * Displays a detailed, scrollable view of ATSC 3.0 PLP info.
  */
-int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
-    char *plpinfo_str;
-    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str) <= 0) {
+int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info) {
+    char *plpinfo_str_orig;
+    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_orig) <= 0) {
         return 0; // No PLP info available
     }
+    char *plpinfo_copy = strdup(plpinfo_str_orig);
 
-    // Store lines for display and scrolling
-    char *display_lines[MAX_PLPS * 3]; // Each PLP can take up to 3 lines
+    char *display_lines[MAX_DISPLAY_LINES]; 
     int line_count = 0;
 
     // Add an initial blank line for spacing
-    if (line_count < MAX_PLPS * 3) {
-        display_lines[line_count++] = strdup("");
+    if (line_count < MAX_DISPLAY_LINES) {
+        display_lines[line_count++] = strdup(" ");
     }
 
-    char *plpinfo_copy = strdup(plpinfo_str);
+    // Add SLT TSID
+    char *streaminfo_str;
+    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str) > 0) {
+        long tsid = parse_status_value(streaminfo_str, "tsid=");
+        if (tsid != -999 && line_count < MAX_DISPLAY_LINES) {
+            char tsid_line[64];
+            sprintf(tsid_line, "SLT TSID: %ld (0x%lX)", tsid, tsid);
+            display_lines[line_count++] = strdup(tsid_line);
+            if (line_count < MAX_DISPLAY_LINES) {
+                display_lines[line_count++] = strdup(" "); // Add a blank line after it
+            }
+        }
+    }
+
     if(plpinfo_copy) {
         char *line = strtok(plpinfo_copy, "\n");
-        while(line != NULL && line_count < MAX_PLPS * 3) {
+        while(line != NULL && line_count < MAX_DISPLAY_LINES) {
             if (strncmp(line, "bsid=", 5) != 0) {
                 display_lines[line_count++] = strdup(line);
                 
-                // Parse mod and cod to look up SNR
                 char *mod_ptr = strstr(line, "mod=");
                 char *cod_ptr = strstr(line, "cod=");
 
-                if (mod_ptr && cod_ptr) {
-                    char raw_mod_str[16] = {0};
-                    char normalized_mod_str[16] = {0};
-                    char cod_str[8] = {0};
+                if (mod_ptr && cod_ptr && line_count < MAX_DISPLAY_LINES) {
+                    char raw_mod_str[16] = {0}, normalized_mod_str[16] = {0}, cod_str[8] = {0};
                     
-                    // Robustly parse the mod string
                     const char *mod_val_start = mod_ptr + 4;
                     const char *mod_val_end = strchr(mod_val_start, ' ');
                     size_t mod_len = mod_val_end ? (size_t)(mod_val_end - mod_val_start) : strlen(mod_val_start);
@@ -1986,7 +2320,6 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
                         normalize_mod_str(raw_mod_str, normalized_mod_str, sizeof(normalized_mod_str));
                     }
 
-                    // Robustly parse the cod string
                     const char *cod_val_start = cod_ptr + 4;
                     const char *cod_val_end = strchr(cod_val_start, ' ');
                     size_t cod_len = cod_val_end ? (size_t)(cod_val_end - cod_val_start) : strlen(cod_val_start);
@@ -2002,14 +2335,48 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
                         display_lines[line_count++] = strdup(snr_line);
                     }
                 }
-                // Add a blank line for spacing
-                if (line_count < MAX_PLPS * 3) {
-                    display_lines[line_count++] = strdup("");
+                if (line_count < MAX_DISPLAY_LINES) {
+                    display_lines[line_count++] = strdup(" ");
                 }
             }
             line = strtok(NULL, "\n");
         }
         free(plpinfo_copy);
+    }
+
+    // --- Add L1 Detail if available ---
+    char *raw_status_str;
+    struct hdhomerun_tuner_status_t status;
+    bool has_db_values = false;
+    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
+        if (parse_db_value(raw_status_str, "ss=") != -999) has_db_values = true;
+    }
+
+    char *version_str;
+    long version_num = 0;
+    if (hdhomerun_device_get_var(hd, "/sys/version", &version_str, NULL) > 0) {
+        char numeric_version_str[16] = {0};
+        int i = 0;
+        while(version_str[i] && isdigit((unsigned char)version_str[i]) && i < 15) {
+            numeric_version_str[i] = version_str[i];
+            i++;
+        }
+        version_num = atol(numeric_version_str);
+    }
+
+    if (has_db_values && version_num > 20250623) {
+        char l1_path[64];
+        sprintf(l1_path, "/tuner%d/l1detail", tuner_info->tuner_index);
+
+        char *l1_detail_str;
+        if (hdhomerun_device_get_var(hd, l1_path, &l1_detail_str, NULL) > 0) {
+            size_t decoded_len;
+            unsigned char *decoded_data = base64_decode(l1_detail_str, &decoded_len);
+            if (decoded_data) {
+                parse_l1_data(decoded_data, decoded_len, display_lines, &line_count, MAX_DISPLAY_LINES);
+                free(decoded_data);
+            }
+        }
     }
 
     int parent_h, parent_w, parent_y, parent_x;
@@ -2021,11 +2388,12 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
     int scroll_pos = 0;
     keypad(detail_win, TRUE);
     nodelay(stdscr, FALSE);
+    char message[256] = {0};
 
     while(1) {
         werase(detail_win);
         box(detail_win, 0, 0);
-        mvwprintw(detail_win, 0, 2, " ATSC 3.0 PLP Details ");
+        mvwprintw(detail_win, 0, 2, " ATSC 3.0 PLP & L1 Details ");
 
         int max_display_lines = getmaxy(detail_win) - 3;
         for (int i = 0; i < max_display_lines; i++) {
@@ -2034,10 +2402,16 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
             }
         }
         
-        mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "Scroll: Up/Down/PgUp/PgDn | Close: x or Enter | Quit: q");
+        if (message[0] != '\0') {
+            mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "%s", message);
+        } else {
+            mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "Scroll: Up/Dn | s: Save | x: Close | q: Quit");
+        }
         wrefresh(detail_win);
 
         int ch = wgetch(detail_win);
+        message[0] = '\0'; // Clear message on any new keypress
+
         switch(ch) {
             case KEY_UP: if (scroll_pos > 0) scroll_pos--; break;
             case KEY_DOWN: if (line_count > max_display_lines && scroll_pos < line_count - max_display_lines) scroll_pos++; break;
@@ -2046,6 +2420,41 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
                 if (line_count > max_display_lines) {
                     scroll_pos += max_display_lines;
                     if (scroll_pos > line_count - max_display_lines) scroll_pos = line_count - max_display_lines;
+                }
+                break;
+            case 's':
+                {
+                    unsigned int rf_channel = 0;
+                    long bsid = 0;
+
+                    char *status_str_s, *plpinfo_str_s;
+                    struct hdhomerun_tuner_status_t status_s;
+                    if (hdhomerun_device_get_tuner_status(hd, &status_str_s, &status_s) > 0) {
+                        char *p = strchr(status_s.channel, ':');
+                        if (!p) p = status_s.channel; else p++;
+                        if (isdigit((unsigned char)*p)) rf_channel = strtoul(p, NULL, 10);
+                    }
+                    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_s) > 0) {
+                        bsid = parse_status_value(plpinfo_str_s, "bsid=");
+                    }
+
+                    char filename[256];
+                    char time_str[20];
+                    time_t now = time(NULL);
+                    struct tm *t = localtime(&now);
+                    strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", t);
+                    sprintf(filename, "rf%u-bsid%ld-details-%s.txt", rf_channel, bsid, time_str);
+                    
+                    FILE *f = fopen(filename, "w");
+                    if (f) {
+                        for(int i = 0; i < line_count; i++) {
+                            fprintf(f, "%s\n", display_lines[i]);
+                        }
+                        fclose(f);
+                        snprintf(message, sizeof(message), "Saved details to %s", filename);
+                    } else {
+                        snprintf(message, sizeof(message), "Error: Could not open file for writing.");
+                    }
                 }
                 break;
             case 'q':
