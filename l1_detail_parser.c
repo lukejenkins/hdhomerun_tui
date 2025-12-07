@@ -798,6 +798,18 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
     if (detail_info->line_count < detail_info->max_lines) {
         detail_info->display_lines[detail_info->line_count++] = strdup(" ");
     }
+    
+    // Add firmware version
+    char *version_str;
+    if (hdhomerun_device_get_var(hd, "/sys/version", &version_str, NULL) > 0) {
+        char version_line[128];
+        sprintf(version_line, "Firmware Version: %s", version_str);
+        detail_info->display_lines[detail_info->line_count++] = strdup(version_line);
+        
+        if (detail_info->line_count < detail_info->max_lines) {
+            detail_info->display_lines[detail_info->line_count++] = strdup(" ");
+        }
+    }
 
     // Add BSID and TSID info
     long bsid = -999;
@@ -895,9 +907,8 @@ int collect_atsc3_details(struct hdhomerun_device_t *hd, int tuner_index, struct
         if (parse_status_value_l1(raw_status_str, "ss=") != -999) has_db_values = true;
     }
 
-    char *version_str;
     long version_num = 0;
-    if (hdhomerun_device_get_var(hd, "/sys/version", &version_str, NULL) > 0) {
+    if (version_str) {
         char numeric_version_str[16] = {0};
         int i = 0;
         while(version_str[i] && isdigit((unsigned char)version_str[i]) && i < 15) {
