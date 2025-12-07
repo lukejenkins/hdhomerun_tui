@@ -12,6 +12,36 @@
  *
  * Then, you can compile with the provided Makefile:
  * make
+ * 
+ * *****
+ * 
+ * This code has been written almost entirely with Google Gemini as a 
+ * personal test of how effective LLMs can be with respect to writing code.
+ * The answer, as it turns out, is "very," but everything needs to be 
+ * validated and it took many iterations to make this work properly.
+ * 
+ * *****
+ * 
+ * HDHomeRun TUI - Copyright (C) 2025 - Mark J. Colombo
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * 
+ * *****
+ *
+ * L1 parsing logic adapted from l1dump.c:
+ * https://github.com/drmpeg/dtv-utils/blob/master/l1dump.c
+ * 
  */
 
 #include <ncurses.h>
@@ -37,7 +67,6 @@
 #include <fcntl.h>
 #include <errno.h>
 
-
 #define MAX_DEVICES 10
 #define MAX_TUNERS_TOTAL 32 // Max combined tuners from all devices
 #define BAR_WIDTH 30
@@ -46,7 +75,9 @@
 #define MAX_PLPS 64
 #define MAX_MAPS 20 // Maximum number of channel maps supported
 #define MAX_PROGRAMS 128
-#define MAX_DISPLAY_LINES (MAX_PLPS * 15 + 150) // Increased buffer for L1 detail
+#define MAX_DISPLAY_LINES (MAX_PLPS * 20 + 300) // Increased buffer for new L1 detail
+
+static const char* TUI_VERSION = "0.8.0";
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
@@ -107,6 +138,7 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
 const struct modcod_snr* get_snr_for_modcod(const char* mod, const char* cod);
 void normalize_mod_str(const char *in, char *out, size_t out_size);
 int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled);
+void parse_l1_data(const unsigned char* data, size_t len, char** display_lines, int* line_count, int max_lines);
 
 
 // --- ATSC 3.0 SNR Lookup Table ---
@@ -580,8 +612,11 @@ void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *l
  * Displays a scrollable help screen. Returns 1 if user quits, 0 otherwise.
  */
 int show_help_screen(WINDOW *parent_win) {
+    char version_title[64];
+    sprintf(version_title, "HDHomeRun TUI Help (v%s)", TUI_VERSION);
+
     const char *help_text[] = {
-        "HDHomeRun TUI Help",
+        version_title,
         "",
         "KEY BINDINGS:",
         "  Up/Dn Arrows : Select tuner to view.",
@@ -631,7 +666,7 @@ int show_help_screen(WINDOW *parent_win) {
             }
         }
         
-        mvwprintw(help_win, getmaxy(help_win) - 2, 2, "Scroll: Up/Down/PgUp/PgDn | Close: x or Enter | Quit: q");
+        mvwprintw(help_win, getmaxy(help_win) - 2, 2, "Scroll: Up/Down/PgUp/PgDn | Close: h or Enter | Quit: q");
         wrefresh(help_win);
 
         int ch = wgetch(help_win);
@@ -659,7 +694,7 @@ int show_help_screen(WINDOW *parent_win) {
             case 'q':
                 delwin(help_win);
                 return 1;
-            case 'x':
+            case 'h':
             case '\n':
             case '\r':
                 delwin(help_win);
@@ -1944,326 +1979,397 @@ int main() {
 }
 
 // --- Base64 and L1 Parsing Helpers ---
+// This section is a direct adaptation of the code from l1dump.c
 
-static const int b64_decode_table[] = {
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
-    -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
-    -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1
-};
+int b64invs[] = { 62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58,
+    59, 60, 61, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
+    6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    43, 44, 45, 46, 47, 48, 49, 50, 51 };
 
-/*
- * base64_decode
- * Decodes a Base64 string. The caller must free the returned buffer.
- */
-unsigned char *base64_decode(const char *data, size_t *out_len) {
-    size_t len = strlen(data);
-    if (len % 4 != 0) return NULL;
+size_t b64_decoded_size(const char *in) {
+    size_t len;
+    size_t ret;
+    size_t i;
 
-    *out_len = len / 4 * 3;
-    if (data[len - 1] == '=') (*out_len)--;
-    if (data[len - 2] == '=') (*out_len)--;
+    if (in == NULL) return 0;
 
-    unsigned char *decoded_data = malloc(*out_len + 1);
-    if (decoded_data == NULL) return NULL;
+    len = strlen(in);
+    ret = len / 4 * 3;
 
-    for (size_t i = 0, j = 0; i < len; i += 4, j += 3) {
-        int v1 = b64_decode_table[(int)data[i]];
-        int v2 = b64_decode_table[(int)data[i+1]];
-        int v3 = (data[i+2] == '=') ? -1 : b64_decode_table[(int)data[i+2]];
-        int v4 = (data[i+3] == '=') ? -1 : b64_decode_table[(int)data[i+3]];
-
-        if (v1 == -1 || v2 == -1) {
-            free(decoded_data);
-            return NULL;
-        }
-
-        decoded_data[j] = (unsigned char)((v1 << 2) | (v2 >> 4));
-        if (v3 != -1) {
-            decoded_data[j + 1] = (unsigned char)(((v2 & 15) << 4) | (v3 >> 2));
-        }
-        if (v4 != -1) {
-            decoded_data[j + 2] = (unsigned char)(((v3 & 3) << 6) | v4);
+    for (i = len; i-- > 0;) {
+        if (in[i] == '=') {
+            ret--;
+        } else {
+            break;
         }
     }
-    decoded_data[*out_len] = '\0';
-    return decoded_data;
+    return ret;
 }
 
-/*
- * get_bits
- * Extracts a specified number of bits from a buffer at a given bit offset.
- */
-uint64_t get_bits(const uint8_t *buffer, int *bit_offset, int num_bits) {
-    uint64_t result = 0;
-    for (int i = 0; i < num_bits; i++) {
-        int byte_pos = (*bit_offset) / 8;
-        int bit_pos = 7 - ((*bit_offset) % 8);
-        if ((buffer[byte_pos] >> bit_pos) & 1) {
-            result |= (1ULL << (num_bits - 1 - i));
+int b64_isvalidchar(char c) {
+    if (c >= '0' && c <= '9') return 1;
+    if (c >= 'A' && c <= 'Z') return 1;
+    if (c >= 'a' && c <= 'z') return 1;
+    if (c == '+' || c == '/' || c == '=') return 1;
+    return 0;
+}
+
+int b64_decode(const char *in, unsigned char *out, size_t outlen) {
+    size_t len;
+    size_t i;
+    size_t j;
+    int v;
+
+    if (in == NULL || out == NULL) return 0;
+
+    len = strlen(in);
+    if (outlen < b64_decoded_size(in) || len % 4 != 0) return 0;
+
+    for (i = 0; i < len; i++) {
+        if (!b64_isvalidchar(in[i])) {
+            return 0;
         }
-        (*bit_offset)++;
     }
-    return result;
+
+    for (i = 0, j = 0; i < len; i += 4, j += 3) {
+        v = b64invs[in[i] - 43];
+        v = (v << 6) | b64invs[in[i + 1] - 43];
+        v = in[i + 2] == '=' ? v << 6 : (v << 6) | b64invs[in[i + 2] - 43];
+        v = in[i + 3] == '=' ? v << 6 : (v << 6) | b64invs[in[i + 3] - 43];
+
+        out[j] = (v >> 16) & 0xFF;
+        if (in[i + 2] != '=') out[j + 1] = (v >> 8) & 0xFF;
+        if (in[i + 3] != '=') out[j + 2] = v & 0xFF;
+    }
+
+    return 1;
 }
 
-// --- A/322 L1 Parsing Data and Functions ---
+// Global variables for the bit parser, from l1dump.c
+#define L1_DUMP_BUFFER_SIZE 512
+static char bits[L1_DUMP_BUFFER_SIZE * 8];
+static int bits_index = 0;
 
-const char* L1B_papr_reduction_map[] = {"None", "TR-PAPR", "L-PAPR", "Reserved"};
-const char* L1B_L1_Detail_fec_type_map[] = {"BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K", "LDPC 64K", "Reserved", "Reserved"};
-const char* L1B_L1_Detail_additional_parity_mode_map[] = {"0%", "2.5%", "5%", "7.5%"};
-const char* L1B_first_sub_fft_size_map[] = {"8K", "16K", "32K", "Reserved"};
-const char* L1B_first_sub_guard_interval_map[] = {
-    "GI_1/192", "GI_2/384", "GI_3/384", "GI_4/384", "GI_6/384", "GI_7/384", 
-    "GI_8/384", "GI_9/384", "GI_10/384", "GI_12/384", "GI_13/384", "GI_14/384", 
-    "GI_15/384", "GI_16/384", "GI_18/384", "GI_20/384"
-};
-const char* L1B_first_sub_scattered_pilot_boost_map[] = {"0dB", "3dB", "4.77dB", "6dB", "7.78dB", "9.54dB", "Reserved", "Reserved"};
-const char* L1D_plp_fec_type_map[] = {"BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K (no BCH)", "LDPC 64K (no BCH)", "Reserved", "Reserved", "BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K", "LDPC 16K", "LDPC 64K", "Reserved", "Reserved"};
-const char* L1D_plp_mod_map[] = {"QPSK", "16-QAM", "64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "N/A", "N/A", "QPSK", "16-QAM", "64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "N/A", "N/A"};
-const char* L1D_plp_cod_map[] = {"2/15", "3/15", "4/15", "5/15", "6/15", "7/15", "8/15", "9/15", "10/15", "11/15", "12/15", "13/15", "N/A", "N/A", "N/A", "N/A"};
+// get_bits function from l1dump.c
+int get_bits(int count) {
+    int i;
+    long value = 0;
+    
+    if (bits_index + count > sizeof(bits)) {
+        return 0;
+    }
+
+    for (i = count; i > 0; i--) {
+        value |= bits[bits_index++] << (i - 1);
+    }
+    return value;
+}
+
 
 /*
  * parse_l1_data
  * Parses the decoded L1 data and adds formatted strings to the display list.
+ * This is a direct adaptation of the parsing logic from l1dump.c
  */
 void parse_l1_data(const unsigned char* data, size_t len, char** display_lines, int* line_count, int max_lines) {
-    int bit_offset = 0;
-    uint64_t L1B_num_subframes, L1B_time_info_flag;
-    uint64_t L1B_first_sub_sbs_first, L1B_first_sub_sbs_last, L1B_first_sub_mimo, L1B_first_sub_mimo_mixed;
-    uint64_t L1D_mimo_mixed = 0;
-    
+    long value;
+    int i, j, k;
+    int l1b_version;
+    int l1b_time_info_flag;
+    int l1b_num_subframes;
+    int l1b_l1_detail_size_bytes;
+    int l1b_first_sub_mimo;
+    int l1b_first_sub_sbs_first;
+    int l1b_first_sub_sbs_last;
+    int l1b_first_sub_mimo_mixed = 0;
+    int l1d_version;
+    int l1d_num_rf;
+    int l1d_mimo = 0;
+    int l1d_sbs_first = 0;
+    int l1d_sbs_last = 0;
+    int l1d_num_plp = 0;
+    int l1d_plp_layer;
+    int l1d_plp_mod = 0;
+    int l1d_plp_TI_mode;
+    int l1d_plp_num_channel_bonded;
+    int l1d_plp_HTI_inter_subframe;
+    int l1d_plp_HTI_num_ti_blocks;
+    int l1d_mimo_mixed;
+
     // Helper to add a line to the display buffer safely
     #define add_line(...) \
         if (*line_count < max_lines) { \
-            char line_buf[256]; \
+            char line_buf[512]; \
             snprintf(line_buf, sizeof(line_buf), __VA_ARGS__); \
             display_lines[(*line_count)++] = strdup(line_buf); \
         }
 
-    add_line("--- L1-Basic Signaling ---");
-    add_line("L1B_version: %lu", get_bits(data, &bit_offset, 3));
-    add_line("L1B_mimo_scattered_pilot_encoding: %lu", get_bits(data, &bit_offset, 1));
-    add_line("L1B_lls_flag: %lu", get_bits(data, &bit_offset, 1));
-    L1B_time_info_flag = get_bits(data, &bit_offset, 2);
-    add_line("L1B_time_info_flag: %lu", L1B_time_info_flag);
-    add_line("L1B_return_channel_flag: %lu", get_bits(data, &bit_offset, 1));
-    uint64_t papr = get_bits(data, &bit_offset, 2);
-    add_line("L1B_papr_reduction: %s", L1B_papr_reduction_map[papr]);
-    uint64_t frame_length_mode = get_bits(data, &bit_offset, 1);
-    add_line("L1B_frame_length_mode: %lu", frame_length_mode);
-    if (frame_length_mode == 0) {
-        add_line("L1B_frame_length: %lu", get_bits(data, &bit_offset, 10));
-        add_line("L1B_excess_samples_per_symbol: %lu", get_bits(data, &bit_offset, 13));
-    } else {
-        add_line("L1B_time_offset: %lu", get_bits(data, &bit_offset, 16));
-        add_line("L1B_additional_samples: %lu", get_bits(data, &bit_offset, 7));
+    // Populate the bit buffer
+    bits_index = 0;
+    int bit_count = 0;
+    for (i = 0; i < len && bit_count < sizeof(bits); i++) {
+        for (int n = 7; n >= 0 && bit_count < sizeof(bits); n--) {
+            bits[bit_count++] = (data[i] & (1 << n)) ? 1 : 0;
+        }
     }
-    L1B_num_subframes = get_bits(data, &bit_offset, 8);
-    add_line("L1B_num_subframes: %lu", L1B_num_subframes);
-    add_line("L1B_preamble_num_symbols: %lu", get_bits(data, &bit_offset, 3));
-    add_line("L1B_preamble_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
-    add_line("L1B_L1_Detail_content_tag: %lu", get_bits(data, &bit_offset, 2));
-    add_line("L1B_L1_Detail_size_bytes: %lu", get_bits(data, &bit_offset, 13));
-    uint64_t l1d_fec = get_bits(data, &bit_offset, 3);
-    add_line("L1B_L1_Detail_fec_type: %s", L1B_L1_Detail_fec_type_map[l1d_fec]);
-    uint64_t l1d_parity = get_bits(data, &bit_offset, 2);
-    add_line("L1B_L1_Detail_additional_parity_mode: %s", L1B_L1_Detail_additional_parity_mode_map[l1d_parity]);
-    add_line("L1B_L1_Detail_total_cells: %lu", get_bits(data, &bit_offset, 19));
-    L1B_first_sub_mimo = get_bits(data, &bit_offset, 1);
-    add_line("L1B_first_sub_mimo: %lu", L1B_first_sub_mimo);
-    add_line("L1B_first_sub_miso: %lu", get_bits(data, &bit_offset, 2));
-    uint64_t fft_size = get_bits(data, &bit_offset, 2);
-    add_line("L1B_first_sub_fft_size: %s", L1B_first_sub_fft_size_map[fft_size]);
-    add_line("L1B_first_sub_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
-    uint64_t gi = get_bits(data, &bit_offset, 4);
-    add_line("L1B_first_sub_guard_interval: %s", L1B_first_sub_guard_interval_map[gi]);
-    add_line("L1B_first_sub_num_ofdm_symbols: %lu", get_bits(data, &bit_offset, 11));
-    add_line("L1B_first_sub_scattered_pilot_pattern: %lu", get_bits(data, &bit_offset, 5));
-    uint64_t sp_boost = get_bits(data, &bit_offset, 3);
-    add_line("L1B_first_sub_scattered_pilot_boost: %s", L1B_first_sub_scattered_pilot_boost_map[sp_boost]);
-    L1B_first_sub_sbs_first = get_bits(data, &bit_offset, 1);
-    add_line("L1B_first_sub_sbs_first: %lu", L1B_first_sub_sbs_first);
-    L1B_first_sub_sbs_last = get_bits(data, &bit_offset, 1);
-    add_line("L1B_first_sub_sbs_last: %lu", L1B_first_sub_sbs_last);
-    L1B_first_sub_mimo_mixed = get_bits(data, &bit_offset, 1);
-    add_line("L1B_first_sub_mimo_mixed: %lu", L1B_first_sub_mimo_mixed);
-    add_line("L1B_reserved: %lu", get_bits(data, &bit_offset, 47));
-    add_line("L1B_crc: 0x%08lX", get_bits(data, &bit_offset, 32));
+    
+    add_line("--- L1-Basic Signaling ---");
+
+    value = get_bits(3); add_line("L1B_version: %ld", value); l1b_version = value;
+    value = get_bits(1); add_line("L1B_mimo_scattered_pilot_encoding: %s", value == 0 ? "Walsh-Hadamard" : "Null pilots");
+    value = get_bits(1); add_line("L1B_lls_flag: %s", value == 0 ? "No LLS" : "LLS present");
+    value = get_bits(2); l1b_time_info_flag = value;
+    switch (value) {
+        case 0: add_line("L1B_time_info_flag: Not included"); break;
+        case 1: add_line("L1B_time_info_flag: ms precision"); break;
+        case 2: add_line("L1B_time_info_flag: us precision"); break;
+        case 3: add_line("L1B_time_info_flag: ns precision"); break;
+    }
+    value = get_bits(1); add_line("L1B_return_channel_flag: %ld", value);
+    value = get_bits(2);
+    switch (value) {
+        case 0: add_line("L1B_papr_reduction: None"); break;
+        case 1: add_line("L1B_papr_reduction: Tone reservation only"); break;
+        case 2: add_line("L1B_papr_reduction: ACE only"); break;
+        case 3: add_line("L1B_papr_reduction: Both TR and ACE"); break;
+    }
+    value = get_bits(1);
+    if (value == 0) {
+        add_line("L1B_frame_length_mode: Time-aligned");
+        value = get_bits(10); add_line("  L1B_frame_length: %ld", value);
+        value = get_bits(13); add_line("  L1B_excess_samples_per_symbol: %ld", value);
+    } else {
+        add_line("L1B_frame_length_mode: Symbol-aligned");
+        value = get_bits(16); add_line("  L1B_time_offset: %ld", value);
+        value = get_bits(7); add_line("  L1B_additional_samples: %ld", value);
+    }
+    value = get_bits(8); add_line("L1B_num_subframes: %ld", value + 1); l1b_num_subframes = value;
+    value = get_bits(3); add_line("L1B_preamble_num_symbols: %ld", value + 1);
+    value = get_bits(3); add_line("L1B_preamble_reduced_carriers: %ld", value);
+    value = get_bits(2); add_line("L1B_L1_Detail_content_tag: %ld", value);
+    value = get_bits(13); add_line("L1B_L1_Detail_size_bytes: %ld", value); l1b_l1_detail_size_bytes = value;
+    value = get_bits(3); add_line("L1B_L1_Detail_fec_type: Mode %ld", value + 1);
+    value = get_bits(2); add_line("L1B_L1_additional_parity_mode: K=%ld", value);
+    value = get_bits(19); add_line("L1B_L1_Detail_total_cells: %ld", value);
+    value = get_bits(1); add_line("L1B_first_sub_mimo: %s", value == 0 ? "No MIMO" : "MIMO"); l1b_first_sub_mimo = value;
+    value = get_bits(2); add_line("L1B_first_sub_miso: %ld", value);
+    value = get_bits(2); add_line("L1B_first_sub_fft_size: %s", (value < 3) ? (value==0?"8K":value==1?"16K":"32K") : "Reserved");
+    value = get_bits(3); add_line("L1B_first_sub_reduced_carriers: %ld", value);
+    value = get_bits(4);
+    switch(value) {
+        case 1: add_line("L1B_first_sub_guard_interval: GI_1_192"); break;
+        case 2: add_line("L1B_first_sub_guard_interval: GI_2_384"); break;
+        case 3: add_line("L1B_first_sub_guard_interval: GI_3_512"); break;
+        case 4: add_line("L1B_first_sub_guard_interval: GI_4_768"); break;
+        case 5: add_line("L1B_first_sub_guard_interval: GI_5_1024"); break;
+        case 6: add_line("L1B_first_sub_guard_interval: GI_6_1536"); break;
+        case 7: add_line("L1B_first_sub_guard_interval: GI_7_2048"); break;
+        case 8: add_line("L1B_first_sub_guard_interval: GI_8_2432"); break;
+        case 9: add_line("L1B_first_sub_guard_interval: GI_9_3072"); break;
+        case 10: add_line("L1B_first_sub_guard_interval: GI_10_3648"); break;
+        case 11: add_line("L1B_first_sub_guard_interval: GI_11_4096"); break;
+        case 12: add_line("L1B_first_sub_guard_interval: GI_12_4864"); break;
+        default: add_line("L1B_first_sub_guard_interval: Reserved (%ld)", value); break;
+    }
+    value = get_bits(11); add_line("L1B_first_sub_num_ofdm_symbols: %ld", value + 1);
+    value = get_bits(5); add_line("L1B_first_sub_scattered_pilot_pattern: %ld", value);
+    value = get_bits(3); add_line("L1B_first_sub_scattered_pilot_boost: %ld", value);
+    value = get_bits(1); add_line("L1B_first_sub_sbs_first: %ld", value); l1b_first_sub_sbs_first = value;
+    value = get_bits(1); add_line("L1B_first_sub_sbs_last: %ld", value); l1b_first_sub_sbs_last = value;
+    if (l1b_version >= 1) {
+        value = get_bits(1); add_line("L1B_first_sub_mimo_mixed: %ld", value); l1b_first_sub_mimo_mixed = value;
+        get_bits(47);
+    } else {
+        get_bits(48);
+    }
+    value = get_bits(32); add_line("L1B_crc: 0x%08lx", value);
     
     add_line(" ");
     add_line("--- L1-Detail Signaling ---");
-    add_line("L1D_version: %lu", get_bits(data, &bit_offset, 4));
-    uint64_t L1D_num_rf = get_bits(data, &bit_offset, 3);
-    add_line("L1D_num_rf: %lu", L1D_num_rf);
-    for (uint64_t rf_id = 0; rf_id < L1D_num_rf; rf_id++) {
-        add_line("  L1D_bonded_bsid[%lu]: %lu", rf_id, get_bits(data, &bit_offset, 16));
-        get_bits(data, &bit_offset, 3); // reserved
+    
+    value = get_bits(4); add_line("L1D_version: %ld", value); l1d_version = value;
+    value = get_bits(3); add_line("L1D_num_rf: %ld", value); l1d_num_rf = value;
+    for (i = 1; i <= l1d_num_rf; i++) {
+        value = get_bits(16); add_line("  L1D_bonded_bsid: 0x%04lx", value);
+        get_bits(3);
     }
-    if (L1B_time_info_flag != 0) {
-        add_line("L1D_time_sec: %lu", get_bits(data, &bit_offset, 32));
-        add_line("L1D_time_msec: %lu", get_bits(data, &bit_offset, 10));
-        if (L1B_time_info_flag != 1) {
-            add_line("L1D_time_usec: %lu", get_bits(data, &bit_offset, 10));
-            if (L1B_time_info_flag != 2) {
-                add_line("L1D_time_nsec: %lu", get_bits(data, &bit_offset, 10));
+    if (l1b_time_info_flag != 0) {
+        value = get_bits(32); add_line("L1D_time_sec: %ld", value);
+        value = get_bits(10); add_line("L1D_time_msec: %ld", value);
+        if (l1b_time_info_flag > 1) {
+            value = get_bits(10); add_line("L1D_time_usec: %ld", value);
+            if (l1b_time_info_flag > 2) {
+                value = get_bits(10); add_line("L1D_time_nsec: %ld", value);
             }
         }
     }
-
-    for (uint64_t i = 0; i <= L1B_num_subframes; i++) {
-        add_line(" ");
-        add_line("Subframe #%lu:", i);
-        uint64_t L1D_mimo = 0, L1D_sbs_first = 0, L1D_sbs_last = 0;
+    for (i = 0; i <= l1b_num_subframes; i++) {
+        add_line(" "); add_line("Subframe #%d:", i);
         if (i > 0) {
-            L1D_mimo = get_bits(data, &bit_offset, 1);
-            add_line("  L1D_mimo: %lu", L1D_mimo);
-            add_line("  L1D_miso: %lu", get_bits(data, &bit_offset, 2));
-            uint64_t l1d_fft = get_bits(data, &bit_offset, 2);
-            add_line("  L1D_fft_size: %s", L1B_first_sub_fft_size_map[l1d_fft]);
-            add_line("  L1D_reduced_carriers: %lu", get_bits(data, &bit_offset, 3));
-            uint64_t l1d_gi = get_bits(data, &bit_offset, 4);
-            add_line("  L1D_guard_interval: %s", L1B_first_sub_guard_interval_map[l1d_gi]);
-            add_line("  L1D_num_ofdm_symbols: %lu", get_bits(data, &bit_offset, 11));
-            add_line("  L1D_scattered_pilot_pattern: %lu", get_bits(data, &bit_offset, 5));
-            uint64_t l1d_sp_boost = get_bits(data, &bit_offset, 3);
-            add_line("  L1D_scattered_pilot_boost: %s", L1B_first_sub_scattered_pilot_boost_map[l1d_sp_boost]);
-            L1D_sbs_first = get_bits(data, &bit_offset, 1);
-            add_line("  L1D_sbs_first: %lu", L1D_sbs_first);
-            L1D_sbs_last = get_bits(data, &bit_offset, 1);
-            add_line("  L1D_sbs_last: %lu", L1D_sbs_last);
-        }
-        if (L1B_num_subframes > 0) {
-            add_line("  L1D_subframe_multiplex: %lu", get_bits(data, &bit_offset, 1));
-        }
-        add_line("  L1D_frequency_interleaver: %lu", get_bits(data, &bit_offset, 1));
-        if (((i == 0) && (L1B_first_sub_sbs_first || L1B_first_sub_sbs_last)) || ((i > 0) && (L1D_sbs_first || L1D_sbs_last))) {
-            add_line("  L1D_sbs_null_cells: %lu", get_bits(data, &bit_offset, 13));
-        }
-        uint64_t L1D_num_plp = get_bits(data, &bit_offset, 6);
-        add_line("  L1D_num_plp: %lu", L1D_num_plp);
-
-        for (uint64_t j = 0; j <= L1D_num_plp; j++) {
-            add_line("    PLP #%lu:", j);
-            add_line("      L1D_plp_id: %lu", get_bits(data, &bit_offset, 6));
-            add_line("      L1D_plp_lls_flag: %lu", get_bits(data, &bit_offset, 1));
-            uint64_t L1D_plp_layer = get_bits(data, &bit_offset, 2);
-            add_line("      L1D_plp_layer: %lu", L1D_plp_layer);
-            add_line("      L1D_plp_start: %lu", get_bits(data, &bit_offset, 24));
-            add_line("      L1D_plp_size: %lu", get_bits(data, &bit_offset, 24));
-            add_line("      L1D_plp_scrambler_type: %lu", get_bits(data, &bit_offset, 2));
-            uint64_t L1D_plp_fec_type = get_bits(data, &bit_offset, 4);
-            add_line("      L1D_plp_fec_type: %s", L1D_plp_fec_type_map[L1D_plp_fec_type]);
-            
-            uint64_t L1D_plp_mod = 0;
-            if (L1D_plp_fec_type <= 5) {
-                L1D_plp_mod = get_bits(data, &bit_offset, 4);
-                add_line("      L1D_plp_mod: %s", L1D_plp_mod_map[L1D_plp_mod]);
-                uint64_t L1D_plp_cod = get_bits(data, &bit_offset, 4);
-                add_line("      L1D_plp_cod: %s", L1D_plp_cod_map[L1D_plp_cod]);
+            value = get_bits(1); add_line("  L1D_mimo: %s", value == 0 ? "No MIMO" : "MIMO"); l1d_mimo = value;
+            value = get_bits(2); add_line("  L1D_miso: %ld", value);
+            value = get_bits(2); add_line("  L1D_fft_size: %s", (value < 3) ? (value==0?"8K":value==1?"16K":"32K") : "Reserved");
+            value = get_bits(3); add_line("  L1D_reduced_carriers: %ld", value);
+            value = get_bits(4);
+            switch(value) {
+                case 1: add_line("  L1D_guard_interval: GI_1_192"); break;
+                case 2: add_line("  L1D_guard_interval: GI_2_384"); break;
+                case 3: add_line("  L1D_guard_interval: GI_3_512"); break;
+                case 4: add_line("  L1D_guard_interval: GI_4_768"); break;
+                case 5: add_line("  L1D_guard_interval: GI_5_1024"); break;
+                case 6: add_line("  L1D_guard_interval: GI_6_1536"); break;
+                case 7: add_line("  L1D_guard_interval: GI_7_2048"); break;
+                case 8: add_line("  L1D_guard_interval: GI_8_2432"); break;
+                case 9: add_line("  L1D_guard_interval: GI_9_3072"); break;
+                case 10: add_line("  L1D_guard_interval: GI_10_3648"); break;
+                case 11: add_line("  L1D_guard_interval: GI_11_4096"); break;
+                case 12: add_line("  L1D_guard_interval: GI_12_4864"); break;
+                default: add_line("  L1D_guard_interval: Reserved (%ld)", value); break;
             }
-            
-            uint64_t L1D_plp_TI_mode = get_bits(data, &bit_offset, 2);
-            add_line("      L1D_plp_TI_mode: %lu", L1D_plp_TI_mode);
-            if (L1D_plp_TI_mode == 0) {
-                add_line("      L1D_plp_fec_block_start: %lu", get_bits(data, &bit_offset, 15));
-            } else if (L1D_plp_TI_mode == 1) {
-                add_line("      L1D_plp_CTI_fec_block_start: %lu", get_bits(data, &bit_offset, 22));
+            value = get_bits(11); add_line("  L1D_num_ofdm_symbols: %ld", value + 1);
+            value = get_bits(5); add_line("  L1D_scattered_pilot_pattern: %ld", value);
+            value = get_bits(3); add_line("  L1D_scattered_pilot_boost: %ld", value);
+            value = get_bits(1); add_line("  L1D_sbs_first: %ld", value); l1d_sbs_first = value;
+            value = get_bits(1); add_line("  L1D_sbs_last: %ld", value); l1d_sbs_last = value;
+        }
+        if (l1b_num_subframes > 0) {
+            value = get_bits(1); add_line("  L1D_subframe_multiplex: %ld", value);
+        }
+        value = get_bits(1); add_line("  L1D_frequency_interleaver: %s", value == 0 ? "Preamble Only" : "All Symbols");
+        if ((i == 0 && (l1b_first_sub_sbs_first == 1 || l1b_first_sub_sbs_last == 1)) || (i > 0 && (l1d_sbs_first == 1 || l1d_sbs_last == 1))) {
+            value = get_bits(13); add_line("  L1D_sbs_null_cells: %ld", value);
+        }
+        value = get_bits(6); add_line("  L1D_num_plp: %ld", value + 1); l1d_num_plp = value;
+        for (j = 0; j <= l1d_num_plp; j++) {
+            add_line("    PLP #%d:", j);
+            value = get_bits(6); add_line("      L1D_plp_id: %ld", value);
+            value = get_bits(1); add_line("      L1D_plp_lls_flag: %ld", value);
+            value = get_bits(2); add_line("      L1D_plp_layer: %s", (value==0) ? "Core" : (value==1 ? "Enhanced" : "Reserved")); l1d_plp_layer = value;
+            value = get_bits(24); add_line("      L1D_plp_start: %ld", value);
+            value = get_bits(24); add_line("      L1D_plp_size: %ld", value);
+            value = get_bits(2); add_line("      L1D_plp_scrambler_type: %s", (value==0) ? "PRBS" : "Reserved");
+            value = get_bits(4);
+            switch (value) {
+                case 0: add_line("      L1D_plp_fec_type: BCH + 16K LDPC"); break;
+                case 1: add_line("      L1D_plp_fec_type: BCH + 64K LDPC"); break;
+                case 2: add_line("      L1D_plp_fec_type: CRC + 16K LDPC"); break;
+                case 3: add_line("      L1D_plp_fec_type: CRC + 64K LDPC"); break;
+                case 4: add_line("      L1D_plp_fec_type: 16K LDPC only"); break;
+                case 5: add_line("      L1D_plp_fec_type: 64K LDPC only"); break;
+                default: add_line("      L1D_plp_fec_type: Reserved"); break;
             }
-            
-            if (L1D_num_rf > 0) {
-                uint64_t L1D_plp_num_channel_bonded = get_bits(data, &bit_offset, 3);
-                add_line("      L1D_plp_num_channel_bonded: %lu", L1D_plp_num_channel_bonded);
-                if (L1D_plp_num_channel_bonded > 0) {
-                    add_line("      L1D_plp_channel_bonding_format: %lu", get_bits(data, &bit_offset, 2));
-                    for (uint64_t k = 0; k < L1D_plp_num_channel_bonded; k++) {
-                        add_line("        L1D_plp_bonded_rf_id[%lu]: %lu", k, get_bits(data, &bit_offset, 3));
+            if (value <= 5) {
+                value = get_bits(4); l1d_plp_mod = value;
+                switch (value) {
+                    case 0: add_line("      L1D_plp_mod: QPSK"); break;
+                    case 1: add_line("      L1D_plp_mod: 16QAM"); break;
+                    case 2: add_line("      L1D_plp_mod: 64QAM"); break;
+                    case 3: add_line("      L1D_plp_mod: 256QAM"); break;
+                    case 4: add_line("      L1D_plp_mod: 1024QAM"); break;
+                    case 5: add_line("      L1D_plp_mod: 4096QAM"); break;
+                    default: add_line("      L1D_plp_mod: Reserved"); break;
+                }
+                value = get_bits(4);
+                switch (value) {
+                    case 0: add_line("      L1D_plp_cod: 2/15"); break;
+                    case 1: add_line("      L1D_plp_cod: 3/15"); break;
+                    case 2: add_line("      L1D_plp_cod: 4/15"); break;
+                    case 3: add_line("      L1D_plp_cod: 5/15"); break;
+                    case 4: add_line("      L1D_plp_cod: 6/15"); break;
+                    case 5: add_line("      L1D_plp_cod: 7/15"); break;
+                    case 6: add_line("      L1D_plp_cod: 8/15"); break;
+                    case 7: add_line("      L1D_plp_cod: 9/15"); break;
+                    case 8: add_line("      L1D_plp_cod: 10/15"); break;
+                    case 9: add_line("      L1D_plp_cod: 11/15"); break;
+                    case 10: add_line("      L1D_plp_cod: 12/15"); break;
+                    case 11: add_line("      L1D_plp_cod: 13/15"); break;
+                    default: add_line("      L1D_plp_cod: Reserved"); break;
+                }
+            }
+            value = get_bits(2); l1d_plp_TI_mode = value;
+            switch (value) {
+                case 0: add_line("      L1D_plp_TI_mode: No TI"); break;
+                case 1: add_line("      L1D_plp_TI_mode: CTI"); break;
+                case 2: add_line("      L1D_plp_TI_mode: HTI"); break;
+                default: add_line("      L1D_plp_TI_mode: Reserved"); break;
+            }
+            if (l1d_plp_TI_mode == 0) { value = get_bits(15); add_line("      L1D_plp_fec_block_start: %ld", value); }
+            else if (l1d_plp_TI_mode == 1) { value = get_bits(22); add_line("      L1D_plp_CTI_fec_block_start: %ld", value); }
+            if (l1d_num_rf > 0) {
+                value = get_bits(3); add_line("      L1D_plp_num_channel_bonded: %ld", value); l1d_plp_num_channel_bonded = value;
+                if (l1d_plp_num_channel_bonded > 0) {
+                    value = get_bits(2); add_line("      L1D_plp_channel_bonding_format: %ld", value);
+                    for (k = 0; k < l1d_plp_num_channel_bonded; k++) {
+                        value = get_bits(3); add_line("        L1D_plp_bonded_rf_id: %ld", value);
                     }
                 }
             }
-            
-            if ((i == 0 && L1B_first_sub_mimo == 1) || (i > 0 && L1D_mimo == 1)) {
-                add_line("      L1D_plp_mimo_stream_combining: %lu", get_bits(data, &bit_offset, 1));
-                add_line("      L1D_plp_mimo_IQ_interleaving: %lu", get_bits(data, &bit_offset, 1));
-                add_line("      L1D_plp_mimo_PH: %lu", get_bits(data, &bit_offset, 1));
+            if ((i == 0 && l1b_first_sub_mimo == 1) || (i > 0 && l1d_mimo)) {
+                value = get_bits(1); add_line("      L1D_plp_mimo_stream_combining: %ld", value);
+                value = get_bits(1); add_line("      L1D_plp_mimo_IQ_interleaving: %ld", value);
+                value = get_bits(1); add_line("      L1D_plp_mimo_PH: %ld", value);
             }
-
-            if (L1D_plp_layer == 0) {
-                uint64_t L1D_plp_type = get_bits(data, &bit_offset, 1);
-                add_line("      L1D_plp_type: %lu", L1D_plp_type);
-                if (L1D_plp_type == 1) {
-                    add_line("      L1D_plp_num_subslices: %lu", get_bits(data, &bit_offset, 14));
-                    add_line("      L1D_plp_subslice_interval: %lu", get_bits(data, &bit_offset, 24));
+            if (l1d_plp_layer == 0) {
+                value = get_bits(1);
+                if (value == 0) { add_line("      L1D_plp_type: non-dispersed"); }
+                else {
+                    add_line("      L1D_plp_type: dispersed");
+                    value = get_bits(14); add_line("      L1D_plp_num_subslices: %ld", value + 1);
+                    value = get_bits(24); add_line("      L1D_plp_subslice_interval: %ld", value);
                 }
-                if (((L1D_plp_TI_mode == 1) || (L1D_plp_TI_mode == 2)) && (L1D_plp_mod == 0)) {
-                    add_line("      L1D_plp_TI_extended_interleaving: %lu", get_bits(data, &bit_offset, 1));
+                if ((l1d_plp_TI_mode == 1 || l1d_plp_TI_mode == 2) && l1d_plp_mod == 0) {
+                    value = get_bits(1);
+                    add_line("      L1D_plp_TI_extended_interleaving: %ld", value);
                 }
-                if (L1D_plp_TI_mode == 1) {
-                    add_line("      L1D_plp_CTI_depth: %lu", get_bits(data, &bit_offset, 3));
-                    add_line("      L1D_plp_CTI_start_row: %lu", get_bits(data, &bit_offset, 11));
-                } else if (L1D_plp_TI_mode == 2) {
-                    uint64_t L1D_plp_HTI_inter_subframe = get_bits(data, &bit_offset, 1);
-                    add_line("      L1D_plp_HTI_inter_subframe: %lu", L1D_plp_HTI_inter_subframe);
-                    uint64_t L1D_plp_HTI_num_ti_blocks = get_bits(data, &bit_offset, 4);
-                    add_line("      L1D_plp_HTI_num_ti_blocks: %lu", L1D_plp_HTI_num_ti_blocks);
-                    add_line("      L1D_plp_HTI_num_fec_blocks_max: %lu", get_bits(data, &bit_offset, 12));
-                    if (L1D_plp_HTI_inter_subframe == 0) {
-                        add_line("      L1D_plp_HTI_num_fec_blocks: %lu", get_bits(data, &bit_offset, 12));
+                if (l1d_plp_TI_mode == 1) {
+                    value = get_bits(3); add_line("      L1D_plp_CTI_depth: %ld", value);
+                    value = get_bits(11); add_line("      L1D_plp_CTI_start_row: %ld", value);
+                } else if (l1d_plp_TI_mode == 2) {
+                    value = get_bits(1); add_line("      L1D_plp_HTI_inter_subframe: %ld", value); l1d_plp_HTI_inter_subframe = value;
+                    value = get_bits(4); add_line("      L1D_plp_HTI_num_ti_blocks: %ld", value + 1); l1d_plp_HTI_num_ti_blocks = value;
+                    value = get_bits(12); add_line("      L1D_plp_HTI_num_fec_blocks_max: %ld", value + 1);
+                    if (l1d_plp_HTI_inter_subframe == 0) {
+                        value = get_bits(12); add_line("      L1D_plp_HTI_num_fec_blocks: %ld", value + 1);
                     } else {
-                        for (uint64_t k = 0; k <= L1D_plp_HTI_num_ti_blocks; k++) {
-                            add_line("        L1D_plp_HTI_num_fec_blocks[%lu]: %lu", k, get_bits(data, &bit_offset, 12));
+                        for (k = 0; k <= l1d_plp_HTI_num_ti_blocks; k++) {
+                            value = get_bits(12); add_line("        L1D_plp_HTI_num_fec_blocks: %ld", value + 1);
                         }
                     }
-                    add_line("      L1D_plp_HTI_cell_interleaver: %lu", get_bits(data, &bit_offset, 1));
+                    value = get_bits(1); add_line("      L1D_plp_HTI_cell_interleaver: %ld", value);
                 }
             } else {
-                add_line("      L1D_plp_ldm_injection_level: %lu", get_bits(data, &bit_offset, 5));
+                value = get_bits(5); add_line("      L1D_plp_ldm_injection_level: %ld", value);
             }
         }
     }
-    
-    add_line("L1D_bsid: %lu", get_bits(data, &bit_offset, 16));
-    for (uint64_t i = 0; i <= L1B_num_subframes; i++) {
-        if (i > 0) {
-            L1D_mimo_mixed = get_bits(data, &bit_offset, 1);
-            add_line("Subframe #%lu L1D_mimo_mixed: %lu", i, L1D_mimo_mixed);
-        }
-        if ((i == 0 && L1B_first_sub_mimo_mixed == 1) || (i > 0 && L1D_mimo_mixed == 1)) {
-            // This part of the spec is complex and depends on values from the PLP loop.
-            // For now, we will skip the inner MIMO details to avoid state complexity and potential errors.
-        }
+    if (l1d_version >= 1) {
+        value = get_bits(16); add_line("L1D_bsid: 0x%04lx", value);
     }
-    add_line("L1D_crc: 0x%08lX", get_bits(data, &bit_offset, 32));
-
-
-    // Display any remaining bits
-    if (bit_offset < len * 8) {
-        add_line(" ");
-        add_line("--- Remaining Unparsed Bits ---");
-        char bit_buf[65]; // 64 bits + null
-        int bit_idx = 0;
-        while(bit_offset < len * 8) {
-            int byte_pos = bit_offset / 8;
-            int bit_pos = 7 - (bit_offset % 8);
-            bit_buf[bit_idx++] = ((data[byte_pos] >> bit_pos) & 1) ? '1' : '0';
-            if (bit_idx == 64) {
-                bit_buf[bit_idx] = '\0';
-                add_line("%s", bit_buf);
-                bit_idx = 0;
+    if (l1d_version >= 2) {
+        for (i = 0; i <= l1b_num_subframes; i++) {
+            if (i > 0) {
+                value = get_bits(1); add_line("  Subframe #%d L1D_mimo_mixed: %ld", i, value); l1d_mimo_mixed = value;
             }
-            bit_offset++;
-        }
-        if (bit_idx > 0) {
-            bit_buf[bit_idx] = '\0';
-            add_line("%s", bit_buf);
+            if ((i == 0 && l1b_first_sub_mimo_mixed == 1) || (i > 0 && l1d_mimo_mixed == 1)) {
+                for (j = 0; j <= l1d_num_plp; j++) {
+                    value = get_bits(1); add_line("    PLP #%d L1D_plp_mimo: %ld", j, value);
+                    if (value == 1) {
+                        value = get_bits(1); add_line("      L1D_plp_mimo_stream_combining: %ld", value);
+                        value = get_bits(1); add_line("      L1D_plp_mimo_IQ_interleaving: %ld", value);
+                        value = get_bits(1); add_line("      L1D_plp_mimo_PH: %ld", value);
+                    }
+                }
+            }
         }
     }
-    add_line(" ");
+    if ((((l1b_l1_detail_size_bytes * 8) - 32) - (bits_index - 200)) > 0) {
+        get_bits(((l1b_l1_detail_size_bytes * 8) - 32) - (bits_index - 200));
+    }
+    value = get_bits(32); add_line("L1D_crc: 0x%08lx", value);
 }
+
 
 
 /*
@@ -2272,10 +2378,19 @@ void parse_l1_data(const unsigned char* data, size_t len, char** display_lines, 
  */
 int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info) {
     char *plpinfo_str_orig;
+    char *streaminfo_str_orig;
+    
+    // Make copies of the strings immediately to avoid buffer overwrites
     if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_orig) <= 0) {
         return 0; // No PLP info available
     }
     char *plpinfo_copy = strdup(plpinfo_str_orig);
+
+    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str_orig) <= 0) {
+        streaminfo_str_orig = "";
+    }
+    char *streaminfo_copy = strdup(streaminfo_str_orig);
+
 
     char *display_lines[MAX_DISPLAY_LINES]; 
     int line_count = 0;
@@ -2285,18 +2400,34 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
         display_lines[line_count++] = strdup(" ");
     }
 
-    // Add SLT TSID
-    char *streaminfo_str;
-    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str) > 0) {
-        long tsid = parse_status_value(streaminfo_str, "tsid=");
-        if (tsid != -999 && line_count < MAX_DISPLAY_LINES) {
-            char tsid_line[64];
-            sprintf(tsid_line, "SLT TSID: %ld (0x%lX)", tsid, tsid);
-            display_lines[line_count++] = strdup(tsid_line);
-            if (line_count < MAX_DISPLAY_LINES) {
-                display_lines[line_count++] = strdup(" "); // Add a blank line after it
-            }
-        }
+    long bsid = -999;
+    long tsid = -999;
+
+    if (plpinfo_copy) {
+        bsid = parse_status_value(plpinfo_copy, "bsid=");
+    }
+    if (streaminfo_copy) {
+        tsid = parse_status_value(streaminfo_copy, "tsid=");
+    }
+
+    if (bsid != -999) {
+        char bsid_line[64];
+        sprintf(bsid_line, "L1D BSID: %ld (0x%lX)", bsid, bsid);
+        display_lines[line_count++] = strdup(bsid_line);
+    } else {
+        display_lines[line_count++] = strdup("L1D BSID: Not set");
+    }
+
+    if (tsid != -999) {
+        char tsid_line[64];
+        sprintf(tsid_line, "SLT TSID: %ld (0x%lX)", tsid, tsid);
+        display_lines[line_count++] = strdup(tsid_line);
+    } else {
+        display_lines[line_count++] = strdup("SLT TSID: Not set");
+    }
+
+    if (line_count < MAX_DISPLAY_LINES) {
+        display_lines[line_count++] = strdup(" "); // Add a blank line after the ID block
     }
 
     if(plpinfo_copy) {
@@ -2341,7 +2472,6 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
             }
             line = strtok(NULL, "\n");
         }
-        free(plpinfo_copy);
     }
 
     // --- Add L1 Detail if available ---
@@ -2370,10 +2500,19 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
 
         char *l1_detail_str;
         if (hdhomerun_device_get_var(hd, l1_path, &l1_detail_str, NULL) > 0) {
-            size_t decoded_len;
-            unsigned char *decoded_data = base64_decode(l1_detail_str, &decoded_len);
+            // Add a separator before L1 detail info
+            if (line_count < MAX_DISPLAY_LINES - 3) {
+                display_lines[line_count++] = strdup(" ");
+                display_lines[line_count++] = strdup("__HLINE__");
+                display_lines[line_count++] = strdup(" ");
+            }
+
+            size_t decoded_len = b64_decoded_size(l1_detail_str);
+            unsigned char *decoded_data = malloc(decoded_len);
             if (decoded_data) {
-                parse_l1_data(decoded_data, decoded_len, display_lines, &line_count, MAX_DISPLAY_LINES);
+                if (b64_decode(l1_detail_str, decoded_data, decoded_len)) {
+                    parse_l1_data(decoded_data, decoded_len, display_lines, &line_count, MAX_DISPLAY_LINES);
+                }
                 free(decoded_data);
             }
         }
@@ -2388,24 +2527,28 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
     int scroll_pos = 0;
     keypad(detail_win, TRUE);
     nodelay(stdscr, FALSE);
-    char message[256] = {0};
+    char message[512] = {0};
 
     while(1) {
         werase(detail_win);
         box(detail_win, 0, 0);
         mvwprintw(detail_win, 0, 2, " ATSC 3.0 PLP & L1 Details ");
 
-        int max_display_lines = getmaxy(detail_win) - 3;
+        int max_display_lines = getmaxy(detail_win) - 4; // Reserve line for spacing
         for (int i = 0; i < max_display_lines; i++) {
             if (scroll_pos + i < line_count) {
-                mvwprintw(detail_win, i + 1, 2, "%s", display_lines[scroll_pos + i]);
+                if (strcmp(display_lines[scroll_pos + i], "__HLINE__") == 0) {
+                    mvwhline(detail_win, i + 1, 2, ACS_HLINE, getmaxx(detail_win) - 4);
+                } else {
+                    mvwprintw(detail_win, i + 1, 2, "%s", display_lines[scroll_pos + i]);
+                }
             }
         }
         
         if (message[0] != '\0') {
             mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "%s", message);
         } else {
-            mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "Scroll: Up/Dn | s: Save | x: Close | q: Quit");
+            mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "Scroll: Up/Dn | s: Save | d: Close | q: Quit");
         }
         wrefresh(detail_win);
 
@@ -2425,25 +2568,40 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
             case 's':
                 {
                     unsigned int rf_channel = 0;
-                    long bsid = 0;
+                    long id_val = -999;
 
-                    char *status_str_s, *plpinfo_str_s;
+                    char *status_str_s, *plpinfo_str_s, *streaminfo_str_s;
                     struct hdhomerun_tuner_status_t status_s;
+                    
                     if (hdhomerun_device_get_tuner_status(hd, &status_str_s, &status_s) > 0) {
                         char *p = strchr(status_s.channel, ':');
                         if (!p) p = status_s.channel; else p++;
                         if (isdigit((unsigned char)*p)) rf_channel = strtoul(p, NULL, 10);
                     }
-                    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_s) > 0) {
-                        bsid = parse_status_value(plpinfo_str_s, "bsid=");
+                    
+                    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str_s) > 0) {
+                        char *si_copy = strdup(streaminfo_str_s);
+                        if (si_copy) {
+                            id_val = parse_status_value(si_copy, "tsid=");
+                            free(si_copy);
+                        }
                     }
+                    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str_s) > 0) {
+                        char *pi_copy = strdup(plpinfo_str_s);
+                        if(pi_copy) {
+                            long bsid_s = parse_status_value(pi_copy, "bsid=");
+                            if (bsid_s != -999) id_val = bsid_s;
+                            free(pi_copy);
+                        }
+                    }
+                    if (id_val == -999) id_val = 0;
 
                     char filename[256];
                     char time_str[20];
                     time_t now = time(NULL);
                     struct tm *t = localtime(&now);
                     strftime(time_str, sizeof(time_str)-1, "%Y%m%d-%H%M%S", t);
-                    sprintf(filename, "rf%u-bsid%ld-details-%s.txt", rf_channel, bsid, time_str);
+                    sprintf(filename, "rf%u-bsid%ld-details-%s.txt", rf_channel, id_val, time_str);
                     
                     FILE *f = fopen(filename, "w");
                     if (f) {
@@ -2460,12 +2618,16 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd, s
             case 'q':
                 delwin(detail_win);
                 for(int i = 0; i < line_count; i++) free(display_lines[i]);
+                free(streaminfo_copy);
+                free(plpinfo_copy);
                 return 1; // Quit requested
-            case 'x':
+            case 'd':
             case '\n':
             case '\r':
                 delwin(detail_win);
                 for(int i = 0; i < line_count; i++) free(display_lines[i]);
+                free(streaminfo_copy);
+                free(plpinfo_copy);
                 nodelay(stdscr, TRUE);
                 return 0;
         }
