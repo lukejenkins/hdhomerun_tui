@@ -24,8 +24,18 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <stdbool.h>
 #include "hdhomerun.h"
 #include "hdhomerun_device.h"
+
+// Headers for native TCP/HTTP download
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <errno.h>
+
 
 #define MAX_DEVICES 10
 #define MAX_TUNERS_TOTAL 32 // Max combined tuners from all devices
@@ -42,6 +52,7 @@ struct unified_tuner {
     char ip_str[64];
     int tuner_index;
     int total_tuners_on_device;
+    bool is_legacy;
 };
 
 // A struct to hold the parsed channel list for a tuner
@@ -66,6 +77,14 @@ enum save_mode {
     SAVE_AUTORESTART_PCAP
 };
 
+// Struct to hold the ATSC 3.0 ModCod to SNR lookup table data
+struct modcod_snr {
+    char mod[16];
+    char cod[8];
+    float min_snr;
+    float max_snr;
+};
+
 // Function Prototypes
 int discover_and_build_tuner_list(struct unified_tuner tuners[]);
 void draw_signal_bar(WINDOW *win, int y, int x, const char *label, int percentage, int db_value, const char* db_unit);
@@ -79,7 +98,96 @@ int compare_plps(const void *a, const void *b);
 void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *list);
 long parse_db_value(const char *status_str, const char *key);
 long parse_status_value(const char *status_str, const char *key);
+char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, struct unified_tuner *tuner_info);
+int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_program_str, int *selected_plp);
+int get_udp_port();
+int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd);
+const struct modcod_snr* get_snr_for_modcod(const char* mod, const char* cod);
+void normalize_mod_str(const char *in, char *out, size_t out_size);
 
+
+// --- ATSC 3.0 SNR Lookup Table ---
+// Data from atsc3_modcod.csv
+static const struct modcod_snr snr_table[] = {
+    {"QPSK", "2/15", -6.23, -5.06}, {"QPSK", "3/15", -4.32, -2.97},
+    {"QPSK", "4/15", -2.89, -1.36}, {"QPSK", "5/15", -1.7, -0.08},
+    {"QPSK", "6/15", -0.54, 1.15}, {"QPSK", "7/15", 0.3, 2.3},
+    {"QPSK", "8/15", 1.16, 3.44}, {"QPSK", "9/15", 1.97, 4.7},
+    {"QPSK", "10/15", 2.77, 5.97}, {"QPSK", "11/15", 3.6, 7.46},
+    {"QPSK", "12/15", 4.49, 9.15}, {"QPSK", "13/15", 5.53, 11.56},
+    {"16QAM", "2/15", -2.73, -1.14}, {"16QAM", "3/15", -0.25, 1.45},
+    {"16QAM", "4/15", 1.46, 3.41}, {"16QAM", "5/15", 2.82, 4.78},
+    {"16QAM", "6/15", 4.21, 6.27}, {"16QAM", "7/15", 5.21, 7.58},
+    {"16QAM", "8/15", 6.3, 8.96}, {"16QAM", "9/15", 7.32, 10.28},
+    {"16QAM", "10/15", 8.36, 11.73}, {"16QAM", "11/15", 9.5, 13.22},
+    {"16QAM", "12/15", 10.57, 14.97}, {"16QAM", "13/15", 11.83, 17.44},
+    {"64QAM", "2/15", -0.26, 1.6}, {"64QAM", "3/15", 2.27, 4.3},
+    {"64QAM", "4/15", 4.07, 6.22}, {"64QAM", "5/15", 5.5, 7.74},
+    {"64QAM", "6/15", 6.96, 9.31}, {"64QAM", "7/15", 8.01, 10.65},
+    {"64QAM", "8/15", 9.11, 12.03}, {"64QAM", "9/15", 10.15, 13.34},
+    {"64QAM", "10/15", 11.21, 14.77}, {"64QAM", "11/15", 12.38, 16.23},
+    {"64QAM", "12/15", 13.48, 17.95}, {"64QAM", "13/15", 14.75, 20.37},
+    {"256QAM", "2/15", 2.37, 4.21}, {"256QAM", "3/15", 5.0, 7.0},
+    {"256QAM", "4/15", 6.88, 8.99}, {"256QAM", "5/15", 8.35, 10.55},
+    {"256QAM", "6/15", 9.85, 12.15}, {"256QAM", "7/15", 10.93, 13.51},
+    {"256QAM", "8/15", 12.05, 14.9}, {"256QAM", "9/15", 13.1, 16.2},
+    {"256QAM", "10/15", 14.18, 17.61}, {"256QAM", "11/15", 15.35, 19.05},
+    {"256QAM", "12/15", 16.45, 20.73}, {"256QAM", "13/15", 17.72, 23.1},
+    {"1024QAM", "2/15", 4.97, 6.81}, {"1024QAM", "3/15", 7.69, 9.7},
+    {"1024QAM", "4/15", 9.61, 11.75}, {"1024QAM", "5/15", 11.12, 13.34},
+    {"1024QAM", "6/15", 12.65, 14.97}, {"1024QAM", "7/15", 13.75, 16.35},
+    {"1024QAM", "8/15", 14.89, 17.75}, {"1024QAM", "9/15", 15.95, 19.06},
+    {"1024QAM", "10/15", 17.03, 20.46}, {"1024QAM", "11/15", 18.2, 21.9},
+    {"1024QAM", "12/15", 19.31, 23.55}, {"1024QAM", "13/15", 20.58, 25.88},
+    {"4096QAM", "2/15", 7.58, 9.41}, {"4096QAM", "3/15", 10.38, 12.4},
+    {"4096QAM", "4/15", 12.34, 14.45}, {"4096QAM", "5/15", 13.88, 16.07},
+    {"4096QAM", "6/15", 15.44, 17.72}, {"4096QAM", "7/15", 16.56, 19.11},
+    {"4096QAM", "8/15", 17.72, 20.52}, {"4096QAM", "9/15", 18.79, 21.84},
+    {"4096QAM", "10/15", 19.88, 23.25}, {"4096QAM", "11/15", 21.05, 24.69},
+    {"4096QAM", "12/15", 22.16, 26.34}, {"4096QAM", "13/15", 23.43, 28.62},
+    {{0}} // Sentinel
+};
+
+/*
+ * normalize_mod_str
+ * Converts a device modulation string (e.g., "qam256") to the table format ("256QAM").
+ */
+void normalize_mod_str(const char *in, char *out, size_t out_size) {
+    char temp[16];
+    char digits[8] = {0};
+    char alphas[8] = {0};
+    int d_idx = 0;
+    int a_idx = 0;
+
+    // Separate digits and letters
+    for (int i = 0; in[i] != '\0' && i < 15; i++) {
+        if (isdigit((unsigned char)in[i])) {
+            if (d_idx < 7) digits[d_idx++] = in[i];
+        } else {
+            if (a_idx < 7) alphas[a_idx++] = toupper((unsigned char)in[i]);
+        }
+    }
+    
+    // Reassemble in the correct order (digits then alphas)
+    if (d_idx > 0) {
+        snprintf(out, out_size, "%s%s", digits, alphas);
+    } else {
+        snprintf(out, out_size, "%s", alphas);
+    }
+}
+
+/*
+ * get_snr_for_modcod
+ * Looks up the min/max SNR for a given modulation and code rate.
+ */
+const struct modcod_snr* get_snr_for_modcod(const char* mod, const char* cod) {
+    for (int i = 0; snr_table[i].mod[0] != 0; i++) {
+        if (strcmp(snr_table[i].mod, mod) == 0 && strcmp(snr_table[i].cod, cod) == 0) {
+            return &snr_table[i];
+        }
+    }
+    return NULL; // Not found
+}
 
 /*
  * discover_and_build_tuner_list
@@ -104,6 +212,7 @@ int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
     while (device && total_tuner_count < MAX_TUNERS_TOTAL) {
         uint32_t device_id = hdhomerun_discover2_device_get_device_id(device);
         int tuner_count = hdhomerun_discover2_device_get_tuner_count(device);
+        bool is_legacy = hdhomerun_discover2_device_is_legacy(device);
         char ip_str[64];
 
         struct hdhomerun_discover2_device_if_t *device_if = hdhomerun_discover2_iter_device_if_first(device);
@@ -116,6 +225,7 @@ int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
             strcpy(tuners[total_tuner_count].ip_str, ip_str);
             tuners[total_tuner_count].tuner_index = i;
             tuners[total_tuner_count].total_tuners_on_device = tuner_count;
+            tuners[total_tuner_count].is_legacy = is_legacy;
             total_tuner_count++;
         }
 
@@ -312,24 +422,26 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
             if(streaminfo_copy) {
                 char *line = strtok(streaminfo_copy, "\n");
                 while (line != NULL && program_count < MAX_PROGRAMS) {
-                    if (strchr(line, ':')) programs[program_count++] = strdup(line);
+                    if (strchr(line, ':') || strstr(line, "program=")) programs[program_count++] = strdup(line);
                     line = strtok(NULL, "\n");
                 }
                 free(streaminfo_copy);
             }
 
-            int required_lines = 2 + program_count;
-            int available_lines = getmaxy(win) - (y - scroll_offset) - 2;
-            bool two_columns = (required_lines > available_lines) && (getmaxx(win) > 80);
+            // If program count > 7, use two columns, provided the window is wide enough.
+            bool two_columns = (program_count > 7) && (getmaxx(win) > 70);
 
-            total_content_lines += 2; // For "Programs:" and spacer
-            if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "Programs:"); } y++;
+            total_content_lines += 1; // For "Programs:" title
+            if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                print_line_in_box(win, y - scroll_offset, 2, "Programs:");
+            }
+            y++;
 
             if (two_columns) {
                 int midpoint = (program_count + 1) / 2;
                 total_content_lines += midpoint;
                 for (int i = 0; i < midpoint; i++) {
-                    if (y - scroll_offset > 0) {
+                    if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
                         print_line_in_box(win, y - scroll_offset, 4, programs[i]);
                         if (i + midpoint < program_count) {
                             print_line_in_box(win, y - scroll_offset, getmaxx(win)/2, programs[i + midpoint]);
@@ -340,7 +452,9 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
             } else {
                 total_content_lines += program_count;
                 for (int i = 0; i < program_count; i++) {
-                    if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 4, programs[i]); }
+                    if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                        print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                    }
                     y++;
                 }
             }
@@ -369,11 +483,17 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
 
             if (plp_count > 0) {
                 total_content_lines += 2 + plp_count;
-                if (y - scroll_offset > 0) { mvwhline(win, y - scroll_offset, 2, ACS_HLINE, getmaxx(win) - 4); } y++;
-                if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "PLP Info:"); } y++;
+                if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                    mvwhline(win, y - scroll_offset, 2, ACS_HLINE, getmaxx(win) - 4);
+                }
+                y++;
+                if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
+                    print_line_in_box(win, y - scroll_offset, 2, "PLP Info:");
+                }
+                y++;
                 qsort(plp_lines, plp_count, sizeof(struct plp_line), compare_plps);
                 for (int i = 0; i < plp_count; i++) {
-                    if (y - scroll_offset > 0) {
+                    if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
                         char* line_to_print = plp_lines[i].text;
                         if (strstr(line_to_print, "lock=1")) {
                             wattron(win, COLOR_PAIR(3)); print_line_in_box(win, y - scroll_offset, 4, line_to_print); wattroff(win, COLOR_PAIR(3));
@@ -442,8 +562,11 @@ int show_help_screen(WINDOW *parent_win) {
         "",
         "KEY BINDINGS:",
         "  Up/Dn Arrows : Select tuner to view.",
+        "  PgUp/PgDn    : Scroll status panel if content overflows.",
         "  Lf/Rt Arrows : Change channel.",
         "  +/- Keys     : Seek for next/previous active channel.",
+        "  v            : View stream in VLC (select program for ATSC 1.0).",
+        "  d (ATSC 3.0) : Show detailed PLP information and SNR requirements.",
         "  c            : Manually tune to a channel/frequency.",
         "  m            : Change the tuner's channel map.",
         "  p            : Set the tuned ATSC 3.0 PLPs.",
@@ -522,6 +645,139 @@ int show_help_screen(WINDOW *parent_win) {
         }
     }
 }
+
+/*
+ * http_save_stream
+ * Performs a download of an HTTP stream using native sockets, replacing wget.
+ * Returns 0 on success, -1 on failure.
+ */
+int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected) {
+    *out_aborted = false;
+    *out_error_detected = false;
+
+    // 1. Create and connect socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Could not create socket."); wrefresh(win); sleep(2);
+        return -1;
+    }
+
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(5004);
+    if (inet_pton(AF_INET, ip_addr, &serv_addr.sin_addr) <= 0) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Invalid IP address."); wrefresh(win); sleep(2);
+        close(sock);
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Could not connect to device."); wrefresh(win); sleep(2);
+        close(sock);
+        return -1;
+    }
+
+    // 2. Send HTTP GET request
+    const char *path_start = strstr(url, "/auto/");
+    if (!path_start) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Invalid URL for request."); wrefresh(win); sleep(2);
+        close(sock);
+        return -1;
+    }
+    char request[512];
+    snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path_start, ip_addr);
+    if (send(sock, request, strlen(request), 0) < 0) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Failed to send request."); wrefresh(win); sleep(2);
+        close(sock);
+        return -1;
+    }
+
+    // 3. Open output file
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        print_line_in_box(win, LINES - 3, 2, "Error: Failed to open file for writing."); wrefresh(win); sleep(2);
+        close(sock);
+        return -1;
+    }
+
+    // 4. Receive data in a non-blocking loop
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+    time_t start_time = time(NULL);
+    bool headers_processed = false;
+    char buffer[8192];
+    
+    while (time(NULL) - start_time < 30) {
+        // Update UI
+        draw_status_pane(win, hd, tuner_info, 0);
+        mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
+        mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
+        
+        print_line_in_box(win, LINES - 4, 2, "Saving to %s... %lds remaining.", filename, 30 - (time(NULL) - start_time));
+        if (autorestart_enabled) {
+            print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop. (Attempt %d/%d)", save_attempts, max_save_attempts);
+        } else {
+            print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop.");
+        }
+        wrefresh(win);
+
+        // Check for user abort
+        int ch = getch();
+        if (ch == KEY_BACKSPACE) {
+            *out_aborted = true;
+            break;
+        }
+
+        // Check for signal errors if autorestart is on
+        if (autorestart_enabled && (time(NULL) - start_time >= 2)) {
+            struct hdhomerun_tuner_status_t current_status;
+            char *current_raw_status;
+            if (hdhomerun_device_get_tuner_status(hd, &current_raw_status, &current_status) > 0) {
+                if (current_status.symbol_error_quality < 100) {
+                    *out_error_detected = true;
+                    break;
+                }
+            }
+        }
+
+        // Receive data from socket
+        int bytes_read = recv(sock, buffer, sizeof(buffer), 0);
+        if (bytes_read > 0) {
+            char *data_to_write = buffer;
+            int len_to_write = bytes_read;
+            if (!headers_processed) {
+                char *body_start = strstr(buffer, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4; // Move pointer past the CRLFCRLF
+                    len_to_write = bytes_read - (body_start - buffer);
+                    data_to_write = body_start;
+                    headers_processed = true;
+                } else {
+                    // Headers not fully received in this chunk, so write nothing yet
+                    len_to_write = 0;
+                }
+            }
+            if (len_to_write > 0) {
+                fwrite(data_to_write, 1, len_to_write, f);
+            }
+        } else if (bytes_read == 0) {
+            // Connection closed by server, successful completion
+            break;
+        } else { // bytes_read < 0
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                // A real error occurred
+                break;
+            }
+            // No data right now, just loop again
+        }
+        napms(20); // Small delay to be CPU-friendly
+    }
+
+    fclose(f);
+    close(sock);
+    return 0;
+}
+
 
 /*
  * save_stream
@@ -627,7 +883,6 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
                 goto restore_and_exit;
             }
 
-            // Increment save attempt counter (only after PLPs are locked)
             save_attempts++;
 
             char filename[256];
@@ -639,89 +894,40 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             
             char url[256];
             sprintf(url, "http://%s:5004/auto/ch%u%s?format=%s", tuner_info->ip_str, rf_channel, plp_str, format);
+            
+            bool aborted = false;
+            bool error_detected = false;
 
-            pid_t pid = fork();
-            if (pid == 0) { // Child process
-                execlp("wget", "wget", "-q", "-c", url, "-O", filename, NULL);
-                _exit(127); // Exit if execlp fails
-            } else if (pid > 0) { // Parent process
-                bool aborted = false;
-                bool error_detected = false;
-                for (int i = 30; i > 0; i--) {
-                    // Update the status display while saving
-                    draw_status_pane(win, hd, tuner_info, 0);
-                    
-                    // Redraw the save progress messages after status update
-                    mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
-                    mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
-                    if (autorestart_enabled) {
-                        print_line_in_box(win, LINES - 4, 2, "Saving to %s... %ds remaining. (Attempt %d/%d)", filename, i, save_attempts, max_save_attempts);
-                    } else {
-                        print_line_in_box(win, LINES - 4, 2, "Saving to %s... %ds remaining.", filename, i);
-                    }
-                    print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop.");
-                    wrefresh(win);
-                    
-                    for (int j = 0; j < 10; j++) {
-                        int ch = getch();
-                        if (ch == KEY_BACKSPACE) {
-                            aborted = true;
-                            break;
-                        }
-                        napms(100);
-                    }
-                    if (aborted) break;
+            // Call the native HTTP download function instead of fork/wget
+            http_save_stream(tuner_info->ip_str, url, filename, win, hd, tuner_info, autorestart_enabled, save_attempts, max_save_attempts, &aborted, &error_detected);
 
-                    if (autorestart_enabled && i <= 28) { // Start checking after 2 seconds
-                        struct hdhomerun_tuner_status_t current_status;
-                        char *current_raw_status;
-                        if (hdhomerun_device_get_tuner_status(hd, &current_raw_status, &current_status) > 0) {
-                            if (current_status.symbol_error_quality < 100) {
-                                error_detected = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                kill(pid, SIGTERM);
-                waitpid(pid, NULL, 0);
-
-                if (autorestart_enabled && error_detected && save_attempts < max_save_attempts) {
-                    remove(filename);
-                    mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
-                    mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
-                    print_line_in_box(win, LINES - 4, 2, "Symbol Quality error. Restarting capture in 1s... (Attempt %d/%d)", save_attempts, max_save_attempts); wrefresh(win);
-                    
-                    // Give tuner time to settle before retrying
-                    napms(500); // Half second delay
-                    
-                    // Restore original channel before retrying
-                    hdhomerun_device_set_tuner_channel(hd, original_channel);
-                    struct hdhomerun_tuner_status_t lock_status;
-                    hdhomerun_device_wait_for_lock(hd, &lock_status);
-                    
-                    sleep(1);
-                    continue; // Continue the while loop to retry
-                } else if (autorestart_enabled && error_detected && save_attempts >= max_save_attempts) {
-                    // Maximum attempts reached
-                    remove(filename);
-                    result_str = (char*)malloc(512);
-                    sprintf(result_str, "Signal too unstable. Failed after %d attempts.", max_save_attempts);
-                    break; // Exit the while loop
-                }
+            if (autorestart_enabled && error_detected && save_attempts < max_save_attempts) {
+                remove(filename);
+                mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
+                mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
+                print_line_in_box(win, LINES - 4, 2, "Symbol Quality error. Restarting capture in 1s... (Attempt %d/%d)", save_attempts, max_save_attempts); wrefresh(win);
                 
-                // Create result string - will be returned after restoration
+                napms(500);
+                hdhomerun_device_set_tuner_channel(hd, original_channel);
+                struct hdhomerun_tuner_status_t lock_status;
+                hdhomerun_device_wait_for_lock(hd, &lock_status);
+                
+                sleep(1);
+                continue; // Continue the while loop to retry
+            } else if (autorestart_enabled && error_detected && save_attempts >= max_save_attempts) {
+                remove(filename);
                 result_str = (char*)malloc(512);
-                if (aborted) {
-                    sprintf(result_str, "Save aborted. Partial file %s may remain.", filename);
-                } else {
-                    sprintf(result_str, "Saved capture to %s", filename);
-                }
-                break; // Exit the while loop
-            } else {
-                print_line_in_box(win, LINES - 3, 2, "Failed to fork process for capture."); wrefresh(win); sleep(2);
-                goto restore_and_exit;
+                sprintf(result_str, "Signal too unstable. Failed after %d attempts.", max_save_attempts);
+                break;
             }
+            
+            result_str = (char*)malloc(512);
+            if (aborted) {
+                sprintf(result_str, "Save aborted. Partial file %s may remain.", filename);
+            } else {
+                sprintf(result_str, "Saved capture to %s", filename);
+            }
+            break; // Exit the while loop
         }
         goto restore_and_exit; // Jump to restoration code
     }
@@ -839,6 +1045,273 @@ restore_and_exit:
 }
 
 /*
+ * get_udp_port
+ * Finds a free ephemeral UDP port for streaming.
+ * Returns the port number on success, -1 on failure.
+ */
+int get_udp_port() {
+    struct sockaddr_in sin;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_ANY); 
+    sin.sin_port = 0; // Ask OS for a free port
+    
+    if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    socklen_t len = sizeof(sin);
+    if (getsockname(sock, (struct sockaddr *)&sin, &len) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    int port = ntohs(sin.sin_port);
+    close(sock);
+    return port;
+}
+
+
+/*
+ * select_program_menu
+ * Displays a menu of available programs for the user to select.
+ * Returns 1 on selection, 0 on cancellation.
+ */
+int select_program_menu(WINDOW *win, char *streaminfo_str, char *selected_program_str, int *selected_plp) {
+    *selected_plp = -1;
+    struct program_info {
+        char display_str[256];
+        char program_num_str[16];
+        int plp;
+    } programs[MAX_PROGRAMS];
+    int program_count = 0;
+
+    char *streaminfo_copy = strdup(streaminfo_str);
+    if (!streaminfo_copy) return 0;
+
+    char *line = strtok(streaminfo_copy, "\n");
+    while (line != NULL && program_count < MAX_PROGRAMS) {
+        while (isspace((unsigned char)*line)) line++;
+
+        // Check for ATSC 3.0 format: "program=..."
+        if (strncmp(line, "program=", 8) == 0) {
+            strncpy(programs[program_count].display_str, line, sizeof(programs[0].display_str) - 1);
+            sscanf(line, "program=%s", programs[program_count].program_num_str);
+            char* plp_start = strstr(line, "plp=");
+            if (plp_start) {
+                sscanf(plp_start, "plp=%d", &programs[program_count].plp);
+            } else {
+                programs[program_count].plp = -1;
+            }
+            program_count++;
+        } 
+        // Check for ATSC 1.0 format: "program [num]: ..." or "[num]: ..."
+        else if (strncmp(line, "program ", 8) == 0 || (isdigit((unsigned char)*line) && strchr(line, ':'))) {
+            strncpy(programs[program_count].display_str, line, sizeof(programs[0].display_str) - 1);
+            if (strncmp(line, "program ", 8) == 0) {
+                sscanf(line, "program %s", programs[program_count].program_num_str);
+            } else {
+                 sscanf(line, "%s", programs[program_count].program_num_str);
+            }
+            char *colon = strchr(programs[program_count].program_num_str, ':');
+            if (colon) *colon = '\0';
+            programs[program_count].plp = -1;
+            program_count++;
+        }
+        line = strtok(NULL, "\n");
+    }
+    free(streaminfo_copy);
+
+    if (program_count == 0) return 0;
+
+    int highlight = 0;
+    int choice = -1;
+    nodelay(stdscr, FALSE);
+
+    while(choice == -1) {
+        wclear(win);
+        box(win, 0, 0);
+        mvwprintw(win, 0, 2, " Select Program to View ");
+        for (int i = 0; i < program_count; i++) {
+            if (i + 2 >= getmaxy(win) - 2) break;
+            if (i == highlight) wattron(win, A_REVERSE);
+            mvwprintw(win, i + 2, 4, "%s", programs[i].display_str);
+            if (i == highlight) wattroff(win, A_REVERSE);
+        }
+        mvwprintw(win, getmaxy(win) - 2, 2, "Select: Up/Down/Enter | Cancel: q");
+        wrefresh(win);
+
+        int key = getch();
+        switch(key) {
+            case KEY_UP:
+                if (highlight > 0) highlight--;
+                break;
+            case KEY_DOWN:
+                if (highlight < program_count - 1) highlight++;
+                break;
+            case '\n':
+            case '\r':
+                choice = highlight;
+                break;
+            case 'q':
+                choice = -2; // Cancel
+                break;
+        }
+    }
+
+    nodelay(stdscr, TRUE);
+
+    if (choice >= 0) {
+        strncpy(selected_program_str, programs[choice].program_num_str, 15);
+        selected_program_str[15] = '\0';
+        *selected_plp = programs[choice].plp;
+    }
+
+    return (choice >= 0);
+}
+
+/*
+ * stream_to_vlc
+ * Manages the process of starting and stopping a video stream to VLC.
+ */
+char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, struct unified_tuner *tuner_info) {
+    char tuner_target_path[64];
+    sprintf(tuner_target_path, "/tuner%d/target", tuner_info->tuner_index);
+
+    // If VLC is already running, stop it.
+    if (*vlc_pid > 0) {
+        kill(*vlc_pid, SIGTERM);
+        waitpid(*vlc_pid, NULL, 0);
+        hdhomerun_device_set_var(hd, tuner_target_path, "none", NULL, NULL);
+        *vlc_pid = 0;
+        return strdup("VLC stream stopped.");
+    }
+
+    // Check for signal lock before starting
+    struct hdhomerun_tuner_status_t status;
+    char *raw_status_str;
+    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) <= 0 || strstr(status.lock_str, "none") != NULL) {
+        return strdup("No signal lock. Cannot start stream.");
+    }
+    
+    // Get the list of available programs
+    char *streaminfo_str;
+    if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_str) <= 0) {
+        return strdup("Failed to get program list.");
+    }
+
+    // Show menu for user to select a program
+    char selected_program[16] = {0};
+    int selected_plp = -1;
+    if (!select_program_menu(win, streaminfo_str, selected_program, &selected_plp)) {
+        return NULL; // User cancelled the menu
+    }
+
+    // Handle ATSC 3.0 tuning if a specific PLP was selected
+    bool is_atsc3 = (strstr(status.lock_str, "atsc3") != NULL);
+    if (is_atsc3) {
+        if (selected_plp != -1) {
+            char freq_buffer[20] = {0};
+            const char *start = strchr(status.channel, ':');
+            if (start) {
+                start++;
+                int i = 0;
+                while (isdigit((unsigned char)*start) && i < (int)sizeof(freq_buffer) - 1) freq_buffer[i++] = *start++;
+                freq_buffer[i] = '\0';
+            }
+            char tune_str[100];
+            sprintf(tune_str, "atsc3:%s:%d", freq_buffer, selected_plp);
+            hdhomerun_device_set_tuner_channel(hd, tune_str);
+            hdhomerun_device_wait_for_lock(hd, &status);
+        } else {
+            return strdup("Selected program has no PLP info.");
+        }
+    }
+    
+    // Set the tuner to the selected program
+    char tuner_program_path[64];
+    sprintf(tuner_program_path, "/tuner%d/program", tuner_info->tuner_index);
+    if (hdhomerun_device_set_var(hd, tuner_program_path, selected_program, NULL, NULL) < 0) {
+        char err_msg[128];
+        sprintf(err_msg, "Failed to set program to %s.", selected_program);
+        return strdup(err_msg);
+    }
+
+    // Get a free port for the RTP stream
+    int port = get_udp_port();
+    if (port < 0) {
+        return strdup("Could not find a free UDP port.");
+    }
+
+    // Dynamically determine the local IP address that connects to the HDHomeRun
+    char local_ip[INET_ADDRSTRLEN];
+    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (temp_sock < 0) { return strdup("Socket error determining local IP."); }
+
+    struct sockaddr_in serv;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_port = htons(65001); // Connect to a port on the HDHomeRun to find the interface
+    if (inet_pton(AF_INET, tuner_info->ip_str, &serv.sin_addr) <= 0) {
+        close(temp_sock);
+        return strdup("Invalid device IP address.");
+    }
+
+    if (connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        close(temp_sock);
+        return strdup("Connect error determining local IP.");
+    }
+
+    struct sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    if (getsockname(temp_sock, (struct sockaddr *)&name, &namelen) < 0) {
+        close(temp_sock);
+        return strdup("getsockname error determining local IP.");
+    }
+    close(temp_sock);
+
+    if (inet_ntop(AF_INET, &name.sin_addr, local_ip, sizeof(local_ip)) == NULL) {
+        return strdup("inet_ntop error determining local IP.");
+    }
+
+    // Set the stream target on the tuner
+    char target_str[128];
+    sprintf(target_str, "rtp://%s:%d", local_ip, port);
+    if (hdhomerun_device_set_var(hd, tuner_target_path, target_str, NULL, NULL) < 0) {
+        return strdup("Failed to set stream target.");
+    }
+
+    // Fork and execute VLC to listen for the stream
+    *vlc_pid = fork();
+    if (*vlc_pid == 0) { // Child process for VLC
+        // Redirect stdout and stderr to /dev/null to prevent TUI corruption
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null != -1) {
+            dup2(dev_null, STDOUT_FILENO);
+            dup2(dev_null, STDERR_FILENO);
+            close(dev_null);
+        }
+        
+        char vlc_url[128];
+        sprintf(vlc_url, "rtp://@:%d", port);
+        execlp("vlc", "vlc", vlc_url, NULL);
+        // If execlp fails, print error and exit child process
+        perror("execlp for vlc failed");
+        _exit(1);
+    } else if (*vlc_pid < 0) {
+        return strdup("Failed to fork for VLC.");
+    }
+
+    return strdup("Streaming to VLC...");
+}
+
+/*
  * main_loop
  * The primary application loop for the unified UI.
  */
@@ -857,6 +1330,9 @@ int main_loop() {
     static int status_scroll_offset = 0;
     int total_content_lines = 0;
 
+    // State for VLC piping
+    static pid_t vlc_pid = 0;
+
     WINDOW *tuner_win = newwin(LINES, LEFT_PANE_WIDTH, 0, 0);
     WINDOW *status_win = newwin(LINES, COLS - LEFT_PANE_WIDTH, 0, LEFT_PANE_WIDTH);
     keypad(stdscr, TRUE);
@@ -869,8 +1345,10 @@ int main_loop() {
     }
 
     while (1) {
-        if (total_tuners > 0) {
-            struct unified_tuner *selected_tuner = &tuners[highlight];
+        bool tuner_changed = false;
+        struct unified_tuner *selected_tuner = (total_tuners > 0) ? &tuners[highlight] : NULL;
+
+        if (selected_tuner) {
             if (hd == NULL || current_device_id != selected_tuner->device_id) {
                 if (hd) hdhomerun_device_destroy(hd);
                 char device_id_str[16];
@@ -878,15 +1356,25 @@ int main_loop() {
                 hd = hdhomerun_device_create_from_str(device_id_str, NULL);
                 current_device_id = selected_tuner->device_id;
                 status_scroll_offset = 0;
+                tuner_changed = true;
             }
             if (hd) {
                 hdhomerun_device_set_tuner(hd, selected_tuner->tuner_index);
-                if (chan_list.count == 0) {
+                if (chan_list.count == 0 || tuner_changed) {
                     populate_channel_list(hd, &chan_list);
                     status_scroll_offset = 0;
                 }
             }
         }
+        
+        // If tuner changed while VLC was running, stop it.
+        if (tuner_changed && vlc_pid > 0) {
+            kill(vlc_pid, SIGTERM); waitpid(vlc_pid, NULL, 0); vlc_pid = 0;
+            hdhomerun_device_set_tuner_target(hd, "none");
+            if (persistent_message) free(persistent_message);
+            persistent_message = strdup("VLC stopped due to tuner change.");
+        }
+
 
         werase(tuner_win);
         box(tuner_win, 0, 0);
@@ -898,8 +1386,20 @@ int main_loop() {
         }
         mvwprintw(tuner_win, LINES - 2, 2, "r: Refresh");
         
-        total_content_lines = draw_status_pane(status_win, hd, (hd) ? &tuners[highlight] : NULL, status_scroll_offset);
+        total_content_lines = draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
         
+        // Check if current tuner is ATSC3 to adjust hint text
+        bool is_atsc3 = false;
+        if(hd) {
+            struct hdhomerun_tuner_status_t current_status;
+            char *raw_status;
+            if(hdhomerun_device_get_tuner_status(hd, &raw_status, &current_status) > 0) {
+                if(strstr(current_status.lock_str, "atsc3")) {
+                    is_atsc3 = true;
+                }
+            }
+        }
+
         if (persistent_message) {
             char *line1 = persistent_message;
             char *line2 = strchr(persistent_message, '\n');
@@ -916,10 +1416,16 @@ int main_loop() {
             print_line_in_box(status_win, LINES - 2, 2, "Press Enter to dismiss...");
             wattroff(status_win, A_REVERSE);
         } else {
-            if (total_content_lines > LINES - 4) {
-                 mvwprintw(status_win, LINES - 2, 2, "PgUp/PgDn: Scroll | h: Help | q: Quit");
+            if (vlc_pid > 0) {
+                 mvwprintw(status_win, LINES - 2, 2, "v: Stop VLC | h: Help | q: Quit");
+            } else if (total_content_lines > LINES - 4) {
+                 mvwprintw(status_win, LINES - 2, 2, "PgUp/PgDn: Scroll | v: View | h: Help | q: Quit");
             } else {
-                 mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
+                 if(is_atsc3) {
+                    mvwprintw(status_win, LINES - 2, 2, "v: View | <-/->: Ch | h: Help | q: Quit");
+                 } else {
+                    mvwprintw(status_win, LINES - 2, 2, "v: View | <-/->: Ch | +/-: Seek | h: Help | q: Quit");
+                 }
             }
         }
 
@@ -927,6 +1433,11 @@ int main_loop() {
         wrefresh(status_win);
 
         int ch = getch();
+
+        if (ch == KEY_MOUSE) {
+            // Just ignore all mouse events we've enabled (scroll wheel)
+            continue;
+        }
 
         if (persistent_message && ch != ERR) {
             free(persistent_message);
@@ -940,11 +1451,22 @@ int main_loop() {
 
         switch(ch) {
             case 'q':
+                if (vlc_pid > 0) { 
+                    kill(vlc_pid, SIGTERM); 
+                    waitpid(vlc_pid, NULL, 0); 
+                    hdhomerun_device_set_tuner_target(hd, "none");
+                }
                 if (hd) hdhomerun_device_destroy(hd);
                 delwin(tuner_win); delwin(status_win);
                 return 0;
 
             case 'r':
+                if (vlc_pid > 0) { 
+                    kill(vlc_pid, SIGTERM); 
+                    waitpid(vlc_pid, NULL, 0); 
+                    vlc_pid = 0; 
+                    hdhomerun_device_set_tuner_target(hd, "none");
+                }
                 if (hd) { hdhomerun_device_destroy(hd); hd = NULL; current_device_id = 0; }
                 chan_list.count = 0; status_scroll_offset = 0;
                 total_tuners = discover_and_build_tuner_list(tuners);
@@ -955,11 +1477,27 @@ int main_loop() {
                 }
                 break;
 
-            case KEY_UP: if (highlight > 0) { highlight--; chan_list.count = 0; status_scroll_offset = 0; } break;
-            case KEY_DOWN: if (highlight < total_tuners - 1) { highlight++; chan_list.count = 0; status_scroll_offset = 0; } break;
+            case KEY_UP: if (highlight > 0) { highlight--; chan_list.count = 0; status_scroll_offset = 0; tuner_changed=true; } break;
+            case KEY_DOWN: if (highlight < total_tuners - 1) { highlight++; chan_list.count = 0; status_scroll_offset = 0; tuner_changed=true; } break;
             
             case KEY_PPAGE: if (status_scroll_offset > 0) status_scroll_offset--; break;
             case KEY_NPAGE: if (status_scroll_offset < total_content_lines - (LINES - 4)) status_scroll_offset++; break;
+
+            case 'd':
+                if(hd && is_atsc3) {
+                    if (show_plp_details_screen(status_win, hd) == 1) { // Quit requested
+                         if (hd) hdhomerun_device_destroy(hd);
+                         delwin(tuner_win); delwin(status_win);
+                         return 0;
+                    }
+                }
+                break;
+
+            case 'v':
+                if (!hd) break;
+                if (persistent_message) free(persistent_message);
+                persistent_message = stream_to_vlc(hd, status_win, &vlc_pid, &tuners[highlight]);
+                break;
 
             case '+':
             case '=':
@@ -1022,7 +1560,7 @@ int main_loop() {
                         wmove(status_win, LINES - 3, 2); wclrtoeol(status_win);
                         box(status_win, 0, 0);
                         print_line_in_box(status_win, LINES - 3, 2, "Seeking %s on ch %u...", (seek_direction == 1) ? "Up" : "Down", new_channel);
-                        draw_status_pane(status_win, hd, &tuners[highlight], status_scroll_offset);
+                        draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
                         mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                         wrefresh(status_win);
 
@@ -1037,7 +1575,7 @@ int main_loop() {
                                 }
                             }
                             
-                            draw_status_pane(status_win, hd, &tuners[highlight], status_scroll_offset);
+                            draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
                             print_line_in_box(status_win, LINES - 3, 2, "Seeking %s on ch %u... (%2.1fs)", (seek_direction == 1) ? "Up" : "Down", new_channel, (25-i)/10.0);
                             mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                             wrefresh(status_win);
@@ -1058,7 +1596,7 @@ int main_loop() {
                 end_seek:
                     wmove(status_win, LINES - 3, 2); wclrtoeol(status_win);
                     box(status_win, 0, 0);
-                    draw_status_pane(status_win, hd, &tuners[highlight], status_scroll_offset);
+                    draw_status_pane(status_win, hd, selected_tuner, status_scroll_offset);
                     mvwprintw(status_win, LINES - 2, 2, "<-/->: Ch | +/-: Seek | h: Help | q: Quit");
                     wrefresh(status_win);
                 }
@@ -1111,18 +1649,18 @@ int main_loop() {
                 {
                     struct hdhomerun_tuner_status_t status;
                     char *raw_status_str;
-                    bool is_atsc3 = false;
+                    bool is_atsc3_save = false;
                     if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
-                        if (strstr(status.lock_str, "atsc3") != NULL) is_atsc3 = true;
+                        if (strstr(status.lock_str, "atsc3") != NULL) is_atsc3_save = true;
                     }
 
                     enum save_mode mode;
                     bool action_valid = true;
                     switch(ch) {
-                        case 's': mode = is_atsc3 ? SAVE_NORMAL_DBG : SAVE_NORMAL_TS; break;
-                        case 'a': mode = is_atsc3 ? SAVE_AUTORESTART_DBG : SAVE_AUTORESTART_TS; break;
-                        case 'x': if (is_atsc3) { mode = SAVE_NORMAL_PCAP; } else { action_valid = false; } break;
-                        case 'z': if (is_atsc3) { mode = SAVE_AUTORESTART_PCAP; } else { action_valid = false; } break;
+                        case 's': mode = is_atsc3_save ? SAVE_NORMAL_DBG : SAVE_NORMAL_TS; break;
+                        case 'a': mode = is_atsc3_save ? SAVE_AUTORESTART_DBG : SAVE_AUTORESTART_TS; break;
+                        case 'x': if (is_atsc3_save) { mode = SAVE_NORMAL_PCAP; } else { action_valid = false; } break;
+                        case 'z': if (is_atsc3_save) { mode = SAVE_AUTORESTART_PCAP; } else { action_valid = false; } break;
                     }
                     
                     if (action_valid) {
@@ -1289,7 +1827,30 @@ int main_loop() {
                  }
                  break;
         }
-        napms(100);
+        
+        // Check if VLC has exited
+        if (vlc_pid > 0) {
+            int status;
+            if (waitpid(vlc_pid, &status, WNOHANG) == vlc_pid) {
+                // VLC has exited. Clean up.
+                hdhomerun_device_set_tuner_target(hd, "none");
+                vlc_pid = 0;
+                if (persistent_message) free(persistent_message);
+                persistent_message = strdup("VLC has been closed.");
+            }
+        }
+
+
+        // Apply conditional polling rate based on device type
+        if (selected_tuner) {
+            if (selected_tuner->is_legacy) {
+                napms(500); // Slower polling for legacy devices
+            } else {
+                napms(100); // Faster polling for modern devices
+            }
+        } else {
+            napms(100); // Default if no tuners
+        }
     }
 }
 
@@ -1306,7 +1867,14 @@ int main() {
     curs_set(0);
     start_color();
     
-    keypad(stdscr, TRUE); // Ensure getch() can see KEY_BACKSPACE
+    // Enable keypad for function keys, etc.
+    keypad(stdscr, TRUE);
+
+    // Enable mouse event tracking for scroll wheel up/down. This allows us
+    // to differentiate between a real KEY_UP/DOWN from the keyboard and a
+    // scroll event from the mouse, which we will ignore. Clicks and drags
+    // for selection will be handled by the terminal as normal.
+    mousemask(BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
 
     init_pair(1, COLOR_RED, COLOR_BLACK);
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
@@ -1332,3 +1900,121 @@ int main() {
     endwin();
     return 0;
 }
+
+/*
+ * show_plp_details_screen
+ * Displays a detailed, scrollable view of ATSC 3.0 PLP info.
+ */
+int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
+    char *plpinfo_str;
+    if (hdhomerun_device_get_tuner_plpinfo(hd, &plpinfo_str) <= 0) {
+        return 0; // No PLP info available
+    }
+
+    // Store lines for display and scrolling
+    char *display_lines[MAX_PLPS * 3]; // Each PLP can take up to 3 lines
+    int line_count = 0;
+
+    char *plpinfo_copy = strdup(plpinfo_str);
+    if(plpinfo_copy) {
+        char *line = strtok(plpinfo_copy, "\n");
+        while(line != NULL && line_count < MAX_PLPS * 3) {
+            if (strncmp(line, "bsid=", 5) != 0) {
+                display_lines[line_count++] = strdup(line);
+                
+                // Parse mod and cod to look up SNR
+                char *mod_ptr = strstr(line, "mod=");
+                char *cod_ptr = strstr(line, "cod=");
+
+                if (mod_ptr && cod_ptr) {
+                    char raw_mod_str[16] = {0};
+                    char normalized_mod_str[16] = {0};
+                    char cod_str[8] = {0};
+                    
+                    // Robustly parse the mod string
+                    const char *mod_val_start = mod_ptr + 4;
+                    const char *mod_val_end = strchr(mod_val_start, ' ');
+                    size_t mod_len = mod_val_end ? (size_t)(mod_val_end - mod_val_start) : strlen(mod_val_start);
+                    if (mod_len < sizeof(raw_mod_str)) {
+                        strncpy(raw_mod_str, mod_val_start, mod_len);
+                        raw_mod_str[mod_len] = '\0';
+                        normalize_mod_str(raw_mod_str, normalized_mod_str, sizeof(normalized_mod_str));
+                    }
+
+                    // Robustly parse the cod string
+                    const char *cod_val_start = cod_ptr + 4;
+                    const char *cod_val_end = strchr(cod_val_start, ' ');
+                    size_t cod_len = cod_val_end ? (size_t)(cod_val_end - cod_val_start) : strlen(cod_val_start);
+                    if (cod_len < sizeof(cod_str)) {
+                        strncpy(cod_str, cod_val_start, cod_len);
+                        cod_str[cod_len] = '\0';
+                    }
+                    
+                    const struct modcod_snr *snr_data = get_snr_for_modcod(normalized_mod_str, cod_str);
+                    if (snr_data) {
+                        char snr_line[256] = {0};
+                        sprintf(snr_line, "  -> Required SNR: Min %.2f dB, Max %.2f dB", snr_data->min_snr, snr_data->max_snr);
+                        display_lines[line_count++] = strdup(snr_line);
+                    }
+                }
+                // Add a blank line for spacing
+                if (line_count < MAX_PLPS * 3) {
+                    display_lines[line_count++] = strdup("");
+                }
+            }
+            line = strtok(NULL, "\n");
+        }
+        free(plpinfo_copy);
+    }
+
+    int parent_h, parent_w, parent_y, parent_x;
+    getmaxyx(parent_win, parent_h, parent_w);
+    getbegyx(parent_win, parent_y, parent_x);
+
+    WINDOW *detail_win = newwin(parent_h, parent_w, parent_y, parent_x);
+    
+    int scroll_pos = 0;
+    keypad(detail_win, TRUE);
+    nodelay(stdscr, FALSE);
+
+    while(1) {
+        werase(detail_win);
+        box(detail_win, 0, 0);
+        mvwprintw(detail_win, 0, 2, " ATSC 3.0 PLP Details ");
+
+        int max_display_lines = getmaxy(detail_win) - 3;
+        for (int i = 0; i < max_display_lines; i++) {
+            if (scroll_pos + i < line_count) {
+                mvwprintw(detail_win, i + 1, 2, "%s", display_lines[scroll_pos + i]);
+            }
+        }
+        
+        mvwprintw(detail_win, getmaxy(detail_win) - 2, 2, "Scroll: Up/Down/PgUp/PgDn | Close: x or Enter | Quit: q");
+        wrefresh(detail_win);
+
+        int ch = wgetch(detail_win);
+        switch(ch) {
+            case KEY_UP: if (scroll_pos > 0) scroll_pos--; break;
+            case KEY_DOWN: if (line_count > max_display_lines && scroll_pos < line_count - max_display_lines) scroll_pos++; break;
+            case KEY_PPAGE: scroll_pos -= max_display_lines; if (scroll_pos < 0) scroll_pos = 0; break;
+            case KEY_NPAGE:
+                if (line_count > max_display_lines) {
+                    scroll_pos += max_display_lines;
+                    if (scroll_pos > line_count - max_display_lines) scroll_pos = line_count - max_display_lines;
+                }
+                break;
+            case 'q':
+                delwin(detail_win);
+                for(int i = 0; i < line_count; i++) free(display_lines[i]);
+                return 1; // Quit requested
+            case 'x':
+            case '\n':
+            case '\r':
+                delwin(detail_win);
+                for(int i = 0; i < line_count; i++) free(display_lines[i]);
+                nodelay(stdscr, TRUE);
+                return 0;
+        }
+    }
+}
+
