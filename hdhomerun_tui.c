@@ -91,7 +91,7 @@ void draw_signal_bar(WINDOW *win, int y, int x, const char *label, int percentag
 void print_line_in_box(WINDOW *win, int y, int x, const char *fmt, ...);
 int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, int scroll_offset);
 int show_help_screen(WINDOW *parent_win);
-char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info);
+char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info, bool debug_enabled);
 int main_loop(void);
 int compare_channels(const void *a, const void *b);
 int compare_plps(const void *a, const void *b);
@@ -104,6 +104,7 @@ int get_udp_port();
 int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd);
 const struct modcod_snr* get_snr_for_modcod(const char* mod, const char* cod);
 void normalize_mod_str(const char *in, char *out, size_t out_size);
+int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled);
 
 
 // --- ATSC 3.0 SNR Lookup Table ---
@@ -153,7 +154,6 @@ static const struct modcod_snr snr_table[] = {
  * Converts a device modulation string (e.g., "qam256") to the table format ("256QAM").
  */
 void normalize_mod_str(const char *in, char *out, size_t out_size) {
-    char temp[16];
     char digits[8] = {0};
     char alphas[8] = {0};
     int d_idx = 0;
@@ -442,9 +442,24 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
                 total_content_lines += midpoint;
                 for (int i = 0; i < midpoint; i++) {
                     if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
-                        print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                        // Print left column
+                        if (strstr(programs[i], "(encrypted)")) {
+                            wattron(win, COLOR_PAIR(1));
+                            print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                            wattroff(win, COLOR_PAIR(1));
+                        } else {
+                            print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                        }
+                        
+                        // Print right column
                         if (i + midpoint < program_count) {
-                            print_line_in_box(win, y - scroll_offset, getmaxx(win)/2, programs[i + midpoint]);
+                            if (strstr(programs[i + midpoint], "(encrypted)")) {
+                                wattron(win, COLOR_PAIR(1));
+                                print_line_in_box(win, y - scroll_offset, getmaxx(win)/2, programs[i + midpoint]);
+                                wattroff(win, COLOR_PAIR(1));
+                            } else {
+                                print_line_in_box(win, y - scroll_offset, getmaxx(win)/2, programs[i + midpoint]);
+                            }
                         }
                     }
                     y++;
@@ -453,7 +468,13 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
                 total_content_lines += program_count;
                 for (int i = 0; i < program_count; i++) {
                     if (y - scroll_offset > 0 && (y - scroll_offset) < getmaxy(win) - 2) {
-                        print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                        if (strstr(programs[i], "(encrypted)")) {
+                            wattron(win, COLOR_PAIR(1));
+                            print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                            wattroff(win, COLOR_PAIR(1));
+                        } else {
+                            print_line_in_box(win, y - scroll_offset, 4, programs[i]);
+                        }
                     }
                     y++;
                 }
@@ -651,12 +672,14 @@ int show_help_screen(WINDOW *parent_win) {
  * Performs a download of an HTTP stream using native sockets, replacing wget.
  * Returns 0 on success, -1 on failure.
  */
-int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected) {
+int http_save_stream(const char *ip_addr, const char *url, const char *filename, WINDOW *win, struct hdhomerun_device_t *hd, struct unified_tuner *tuner_info, bool autorestart_enabled, int save_attempts, int max_save_attempts, bool *out_aborted, bool *out_error_detected, bool debug_enabled) {
     *out_aborted = false;
     *out_error_detected = false;
 
     // 1. Create and connect socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int rcvbuf_size = 2 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
     if (sock < 0) {
         print_line_in_box(win, LINES - 3, 2, "Error: Could not create socket."); wrefresh(win); sleep(2);
         return -1;
@@ -703,17 +726,28 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
 
     // 4. Receive data in a non-blocking loop
     fcntl(sock, F_SETFL, O_NONBLOCK);
-    time_t start_time = time(NULL);
+    struct timespec start_time, current_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    long elapsed_ms = 0;
     bool headers_processed = false;
-    char buffer[8192];
+    char buffer[65536]; // Increased buffer size
     
-    while (time(NULL) - start_time < 30) {
+    while (elapsed_ms < 30000) {
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + (current_time.tv_nsec - start_time.tv_nsec) / 1000000;
+        long remaining_s = (30000 - elapsed_ms) / 1000;
+        if (remaining_s < 0) remaining_s = 0;
+
         // Update UI
         draw_status_pane(win, hd, tuner_info, 0);
+        mvwhline(win, LINES - 5, 1, ' ', getmaxx(win) - 2);
         mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
         mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
         
-        print_line_in_box(win, LINES - 4, 2, "Saving to %s... %lds remaining.", filename, 30 - (time(NULL) - start_time));
+        if (debug_enabled) {
+            print_line_in_box(win, LINES - 5, 2, "URL: %s", url);
+        }
+        print_line_in_box(win, LINES - 4, 2, "Saving to %s... %lds remaining.", filename, remaining_s);
         if (autorestart_enabled) {
             print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop. (Attempt %d/%d)", save_attempts, max_save_attempts);
         } else {
@@ -729,7 +763,7 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
         }
 
         // Check for signal errors if autorestart is on
-        if (autorestart_enabled && (time(NULL) - start_time >= 2)) {
+        if (autorestart_enabled && (elapsed_ms >= 2000)) {
             struct hdhomerun_tuner_status_t current_status;
             char *current_raw_status;
             if (hdhomerun_device_get_tuner_status(hd, &current_raw_status, &current_status) > 0) {
@@ -770,7 +804,6 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
             }
             // No data right now, just loop again
         }
-        napms(20); // Small delay to be CPU-friendly
     }
 
     fclose(f);
@@ -783,7 +816,7 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
  * save_stream
  * Saves a 30-second transport stream capture to a file.
  */
-char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info) {
+char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mode, struct unified_tuner *tuner_info, bool debug_enabled) {
     struct hdhomerun_tuner_status_t status;
     char *raw_status_str;
     if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) <= 0) {
@@ -899,7 +932,7 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             bool error_detected = false;
 
             // Call the native HTTP download function instead of fork/wget
-            http_save_stream(tuner_info->ip_str, url, filename, win, hd, tuner_info, autorestart_enabled, save_attempts, max_save_attempts, &aborted, &error_detected);
+            http_save_stream(tuner_info->ip_str, url, filename, win, hd, tuner_info, autorestart_enabled, save_attempts, max_save_attempts, &aborted, &error_detected, debug_enabled);
 
             if (autorestart_enabled && error_detected && save_attempts < max_save_attempts) {
                 remove(filename);
@@ -963,15 +996,22 @@ char* save_stream(struct hdhomerun_device_t *hd, WINDOW *win, enum save_mode mod
             return NULL;
         }
 
-        time_t start_time = time(NULL);
+        struct timespec start_time, current_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+        long elapsed_ms = 0;
         bool error_detected = false;
         bool aborted = false;
         unsigned long long total_bytes = 0;
 
-        while(time(NULL) - start_time < 30) {
+        while(elapsed_ms < 30000) {
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + (current_time.tv_nsec - start_time.tv_nsec) / 1000000;
+            long remaining_s = (30000 - elapsed_ms) / 1000;
+            if (remaining_s < 0) remaining_s = 0;
+
             mvwhline(win, LINES - 4, 1, ' ', getmaxx(win) - 2);
             mvwhline(win, LINES - 3, 1, ' ', getmaxx(win) - 2);
-            print_line_in_box(win, LINES - 4, 2, "Saving to %s... %lds remaining.", filename, 30 - (time(NULL) - start_time));
+            print_line_in_box(win, LINES - 4, 2, "Saving to %s... %lds remaining.", filename, remaining_s);
             print_line_in_box(win, LINES - 3, 2, "Press Backspace to stop.");
             wrefresh(win);
 
@@ -1212,27 +1252,6 @@ char* stream_to_vlc(struct hdhomerun_device_t *hd, WINDOW *win, pid_t *vlc_pid, 
     if (!select_program_menu(win, streaminfo_str, selected_program, &selected_plp)) {
         return NULL; // User cancelled the menu
     }
-
-    // Handle ATSC 3.0 tuning if a specific PLP was selected
-    bool is_atsc3 = (strstr(status.lock_str, "atsc3") != NULL);
-    if (is_atsc3) {
-        if (selected_plp != -1) {
-            char freq_buffer[20] = {0};
-            const char *start = strchr(status.channel, ':');
-            if (start) {
-                start++;
-                int i = 0;
-                while (isdigit((unsigned char)*start) && i < (int)sizeof(freq_buffer) - 1) freq_buffer[i++] = *start++;
-                freq_buffer[i] = '\0';
-            }
-            char tune_str[100];
-            sprintf(tune_str, "atsc3:%s:%d", freq_buffer, selected_plp);
-            hdhomerun_device_set_tuner_channel(hd, tune_str);
-            hdhomerun_device_wait_for_lock(hd, &status);
-        } else {
-            return strdup("Selected program has no PLP info.");
-        }
-    }
     
     // Set the tuner to the selected program
     char tuner_program_path[64];
@@ -1332,6 +1351,10 @@ int main_loop() {
 
     // State for VLC piping
     static pid_t vlc_pid = 0;
+    // State for mouse control
+    static bool mouse_scroll_enabled = false;
+    // State for debug mode
+    static bool debug_mode_enabled = false;
 
     WINDOW *tuner_win = newwin(LINES, LEFT_PANE_WIDTH, 0, 0);
     WINDOW *status_win = newwin(LINES, COLS - LEFT_PANE_WIDTH, 0, LEFT_PANE_WIDTH);
@@ -1435,8 +1458,17 @@ int main_loop() {
         int ch = getch();
 
         if (ch == KEY_MOUSE) {
-            // Just ignore all mouse events we've enabled (scroll wheel)
-            continue;
+            if (mouse_scroll_enabled) {
+                MEVENT event;
+                if (getmouse(&event) == OK) {
+                    if (event.bstate & BUTTON4_PRESSED) { // Scroll up
+                        if (status_scroll_offset > 0) status_scroll_offset--;
+                    } else if (event.bstate & BUTTON5_PRESSED) { // Scroll down
+                        if (status_scroll_offset < total_content_lines - (LINES - 4)) status_scroll_offset++;
+                    }
+                }
+            }
+            continue; // Always continue to avoid switch statement processing mouse
         }
 
         if (persistent_message && ch != ERR) {
@@ -1664,7 +1696,7 @@ int main_loop() {
                     }
                     
                     if (action_valid) {
-                        persistent_message = save_stream(hd, status_win, mode, &tuners[highlight]);
+                        persistent_message = save_stream(hd, status_win, mode, &tuners[highlight], debug_mode_enabled);
                     }
                 }
                 break;
@@ -1697,8 +1729,16 @@ int main_loop() {
                     return 0;
                 }
                 break;
+            
+            case 'w': // Hidden toggle for mouse scroll
+                mouse_scroll_enabled = !mouse_scroll_enabled;
+                break;
 
-            case 'm':
+            case 'g': // Hidden toggle for debug mode
+                debug_mode_enabled = !debug_mode_enabled;
+                break;
+
+            case 'm': // Change channel map
                  if (!hd) break;
                  {
                     char *features_str;
@@ -1892,7 +1932,7 @@ int main() {
         refresh();
         nodelay(stdscr, FALSE);
         int ch = getch();
-        if (ch != 'r') {
+        if (ch != 'r' && ch != 'R') {
             break;
         }
     }
@@ -1914,6 +1954,11 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
     // Store lines for display and scrolling
     char *display_lines[MAX_PLPS * 3]; // Each PLP can take up to 3 lines
     int line_count = 0;
+
+    // Add an initial blank line for spacing
+    if (line_count < MAX_PLPS * 3) {
+        display_lines[line_count++] = strdup("");
+    }
 
     char *plpinfo_copy = strdup(plpinfo_str);
     if(plpinfo_copy) {
@@ -2017,4 +2062,3 @@ int show_plp_details_screen(WINDOW *parent_win, struct hdhomerun_device_t *hd) {
         }
     }
 }
-
