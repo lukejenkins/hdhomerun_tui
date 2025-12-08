@@ -8,6 +8,11 @@ LDFLAGS = -lncurses -lpthread
 # OS Detection
 OS := $(shell uname -s)
 
+# macOS-specific: Define mouse button constants not available in older ncurses
+ifeq ($(OS),Darwin)
+  CFLAGS += -DBUTTON4_PRESSED=0x00080000L -DBUTTON5_PRESSED=0x00200000L
+endif
+
 # Name of the final executable
 TARGET = hdhomerun_tui
 
