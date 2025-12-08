@@ -1,0 +1,3 @@
+[submodule "libhdhomerun"]
+	path = libhdhomerun
+	url = https://github.com/Silicondust/libhdhomerun
