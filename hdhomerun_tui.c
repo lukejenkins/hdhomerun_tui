@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
@@ -75,6 +76,9 @@
 #define MAX_PROGRAMS 128
 
 static const char* TUI_VERSION = "0.8.6";
+
+// Global variable to hold device filter from command line
+static char* target_device = NULL;
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
@@ -132,7 +136,11 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
  */
 int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
     clear();
-    mvprintw(0, 0, "Discovering HDHomeRun devices...");
+    if (target_device) {
+        mvprintw(0, 0, "Discovering HDHomeRun device: %s...", target_device);
+    } else {
+        mvprintw(0, 0, "Discovering HDHomeRun devices...");
+    }
     refresh();
 
     struct hdhomerun_discover_t *ds = hdhomerun_discover_create(NULL);
@@ -157,13 +165,28 @@ int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
         hdhomerun_discover2_device_if_get_ip_addr(device_if, &ip_address);
         hdhomerun_sock_sockaddr_to_ip_str(ip_str, (struct sockaddr *)&ip_address, true);
 
-        for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
-            tuners[total_tuner_count].device_id = device_id;
-            strcpy(tuners[total_tuner_count].ip_str, ip_str);
-            tuners[total_tuner_count].tuner_index = i;
-            tuners[total_tuner_count].total_tuners_on_device = tuner_count;
-            tuners[total_tuner_count].is_legacy = is_legacy;
-            total_tuner_count++;
+        // Filter by device if specified on command line
+        bool device_matches = true;
+        if (target_device != NULL) {
+            char device_id_str[16];
+            snprintf(device_id_str, sizeof(device_id_str), "%08X", device_id);
+            
+            // Check if target matches device ID or IP address
+            if (strcasecmp(target_device, device_id_str) != 0 && 
+                strcmp(target_device, ip_str) != 0) {
+                device_matches = false;
+            }
+        }
+
+        if (device_matches) {
+            for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
+                tuners[total_tuner_count].device_id = device_id;
+                strcpy(tuners[total_tuner_count].ip_str, ip_str);
+                tuners[total_tuner_count].tuner_index = i;
+                tuners[total_tuner_count].total_tuners_on_device = tuner_count;
+                tuners[total_tuner_count].is_legacy = is_legacy;
+                total_tuner_count++;
+            }
         }
 
         device = hdhomerun_discover2_iter_device_next(device);
@@ -1860,7 +1883,39 @@ int main_loop() {
  * main
  * Entry point of the application.
  */
-int main() {
+void print_usage(const char *program_name) {
+    printf("HDHomeRun TUI v%s\n", TUI_VERSION);
+    printf("Usage: %s [options]\n", program_name);
+    printf("\nOptions:\n");
+    printf("  -d, --device <id|ip>    Specify HDHomeRun device by ID or IP address\n");
+    printf("                          Example: -d 12345678 or -d 192.168.1.100\n");
+    printf("  -h, --help              Show this help message\n");
+    printf("\nIf no device is specified, all available devices will be discovered.\n");
+}
+
+int main(int argc, char *argv[]) {
+    // Parse command line arguments
+    int opt;
+    static struct option long_options[] = {
+        {"device", required_argument, 0, 'd'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    while ((opt = getopt_long(argc, argv, "d:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'd':
+                target_device = optarg;
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+
     initscr();
     clear();
     noecho();
@@ -1888,7 +1943,11 @@ int main() {
         }
         // If result is 1 (no devices), show message and wait for input
         clear();
-        mvprintw(LINES / 2, (COLS - 28) / 2, "No HDHomeRun devices found.");
+        if (target_device) {
+            mvprintw(LINES / 2, (COLS - 40) / 2, "HDHomeRun device '%s' not found.", target_device);
+        } else {
+            mvprintw(LINES / 2, (COLS - 28) / 2, "No HDHomeRun devices found.");
+        }
         mvprintw(LINES / 2 + 2, (COLS - 40) / 2, "Press 'r' to refresh, or 'q' to quit.");
         refresh();
         nodelay(stdscr, FALSE);
