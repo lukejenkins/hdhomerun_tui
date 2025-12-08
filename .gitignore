@@ -86,3 +86,6 @@ DerivedData/
 *~
 *.log
 *.tmp
+
+# Project specific ignores
+hdhomerun_tui
