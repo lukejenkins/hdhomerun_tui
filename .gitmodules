@@ -3,3 +3,4 @@
 	url = https://github.com/Silicondust/libhdhomerun
 	branch = master
 	commit = 572ddaf9a06afbc098377f84ee840f7644cf4390
+	ignore = dirty

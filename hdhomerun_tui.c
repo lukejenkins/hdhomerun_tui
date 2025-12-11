@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
@@ -75,6 +76,33 @@
 #define MAX_PROGRAMS 128
 
 static const char* TUI_VERSION = "0.8.6";
+
+// Global variable to hold device filter from command line
+static char* target_device = NULL;
+
+// Global debug logging
+static FILE* debug_log_file = NULL;
+static bool verbose_mode = false;
+
+// Debug logging function
+void log_debug(const char* format, ...) {
+    if (!verbose_mode) return;
+    
+    va_list args;
+    time_t now = time(NULL);
+    char timestamp[26];
+    struct tm* tm_info = localtime(&now);
+    strftime(timestamp, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    if (debug_log_file) {
+        fprintf(debug_log_file, "[%s] ", timestamp);
+        va_start(args, format);
+        vfprintf(debug_log_file, format, args);
+        va_end(args);
+        fprintf(debug_log_file, "\n");
+        fflush(debug_log_file);
+    }
+}
 
 // A struct to hold information about a single, unique tuner
 struct unified_tuner {
@@ -132,20 +160,33 @@ int http_save_stream(const char *ip_addr, const char *url, const char *filename,
  */
 int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
     clear();
-    mvprintw(0, 0, "Discovering HDHomeRun devices...");
+    if (target_device) {
+        mvprintw(0, 0, "Discovering HDHomeRun device: %s...", target_device);
+        log_debug("Starting discovery for specific device: %s", target_device);
+    } else {
+        mvprintw(0, 0, "Discovering HDHomeRun devices...");
+        log_debug("Starting discovery for all devices");
+    }
     refresh();
 
     struct hdhomerun_discover_t *ds = hdhomerun_discover_create(NULL);
-    if (!ds) return 0;
-
-    uint32_t device_types[1] = { HDHOMERUN_DEVICE_TYPE_TUNER };
-    if (hdhomerun_discover2_find_devices_broadcast(ds, HDHOMERUN_DISCOVER_FLAGS_IPV4_GENERAL, device_types, 1) < 0) {
-        hdhomerun_discover_destroy(ds);
+    if (!ds) {
+        log_debug("ERROR: Failed to create discovery object");
         return 0;
     }
 
+    uint32_t device_types[1] = { HDHOMERUN_DEVICE_TYPE_TUNER };
+    log_debug("Broadcasting discovery request...");
+    if (hdhomerun_discover2_find_devices_broadcast(ds, HDHOMERUN_DISCOVER_FLAGS_IPV4_GENERAL, device_types, 1) < 0) {
+        log_debug("ERROR: Discovery broadcast failed");
+        hdhomerun_discover_destroy(ds);
+        return 0;
+    }
+    log_debug("Discovery broadcast completed");
+
     int total_tuner_count = 0;
     struct hdhomerun_discover2_device_t *device = hdhomerun_discover2_iter_device_first(ds);
+    log_debug("Iterating through discovered devices...");
     while (device && total_tuner_count < MAX_TUNERS_TOTAL) {
         uint32_t device_id = hdhomerun_discover2_device_get_device_id(device);
         int tuner_count = hdhomerun_discover2_device_get_tuner_count(device);
@@ -156,20 +197,123 @@ int discover_and_build_tuner_list(struct unified_tuner tuners[]) {
         struct sockaddr_storage ip_address;
         hdhomerun_discover2_device_if_get_ip_addr(device_if, &ip_address);
         hdhomerun_sock_sockaddr_to_ip_str(ip_str, (struct sockaddr *)&ip_address, true);
+        
+        log_debug("Found device: ID=%08X, IP=%s, Tuners=%d, Legacy=%s", 
+                  device_id, ip_str, tuner_count, is_legacy ? "yes" : "no");
 
-        for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
-            tuners[total_tuner_count].device_id = device_id;
-            strcpy(tuners[total_tuner_count].ip_str, ip_str);
-            tuners[total_tuner_count].tuner_index = i;
-            tuners[total_tuner_count].total_tuners_on_device = tuner_count;
-            tuners[total_tuner_count].is_legacy = is_legacy;
-            total_tuner_count++;
+        // Filter by device if specified on command line
+        bool device_matches = true;
+        if (target_device != NULL) {
+            char device_id_str[16];
+            snprintf(device_id_str, sizeof(device_id_str), "%08X", device_id);
+            
+            log_debug("Checking if device matches target '%s': DeviceID=%s, IP=%s",
+                      target_device, device_id_str, ip_str);
+            
+            // Check if target matches device ID or IP address
+            if (strcasecmp(target_device, device_id_str) != 0 && 
+                strcmp(target_device, ip_str) != 0) {
+                device_matches = false;
+                log_debug("Device does NOT match target (ID comparison: %s, IP comparison: %s)",
+                          strcasecmp(target_device, device_id_str) != 0 ? "false" : "true",
+                          strcmp(target_device, ip_str) != 0 ? "false" : "true");
+            } else {
+                log_debug("Device MATCHES target!");
+            }
+        }
+
+        if (device_matches) {
+            log_debug("Adding %d tuners from device %08X to tuner list", tuner_count, device_id);
+            for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
+                tuners[total_tuner_count].device_id = device_id;
+                strcpy(tuners[total_tuner_count].ip_str, ip_str);
+                tuners[total_tuner_count].tuner_index = i;
+                tuners[total_tuner_count].total_tuners_on_device = tuner_count;
+                tuners[total_tuner_count].is_legacy = is_legacy;
+                log_debug("  Added tuner %d: %08X-%d (%s)", 
+                          total_tuner_count, device_id, i, ip_str);
+                total_tuner_count++;
+            }
         }
 
         device = hdhomerun_discover2_iter_device_next(device);
     }
 
     hdhomerun_discover_destroy(ds);
+    log_debug("Discovery complete. Total tuners found: %d", total_tuner_count);
+    
+    // If no devices found and a specific target was provided, try direct connection
+    // This is needed for connecting across Layer 3 boundaries where broadcast discovery fails
+    if (total_tuner_count == 0 && target_device != NULL) {
+        log_debug("No devices found via broadcast discovery. Attempting direct connection to: %s", target_device);
+        
+        // Try to create a device directly from the target string (supports IP or device ID)
+        struct hdhomerun_device_t *test_hd = hdhomerun_device_create_from_str(target_device, NULL);
+        if (test_hd) {
+            log_debug("Direct device connection created successfully");
+            
+            // Try to get device ID to confirm connectivity
+            uint32_t device_id = hdhomerun_device_get_device_id(test_hd);
+            if (device_id != 0) {
+                log_debug("Device responded with ID: %08X", device_id);
+                
+                // Get the actual IP address
+                uint32_t device_ip = hdhomerun_device_get_device_ip(test_hd);
+                struct in_addr addr;
+                addr.s_addr = htonl(device_ip);
+                char ip_str[64];
+                strncpy(ip_str, inet_ntoa(addr), sizeof(ip_str) - 1);
+                ip_str[sizeof(ip_str) - 1] = '\0';
+                log_debug("Device IP address: %s", ip_str);
+                
+                // Probe for tuner count by trying each tuner until we get an error
+                int tuner_count = 0;
+                for (int i = 0; i < 16; i++) {  // Max 16 tuners (reasonable limit)
+                    hdhomerun_device_set_tuner(test_hd, i);
+                    char *status_str = NULL;
+                    struct hdhomerun_tuner_status_t status;
+                    
+                    // Try to get tuner status - if it fails, we've exceeded tuner count
+                    int result = hdhomerun_device_get_tuner_status(test_hd, &status_str, &status);
+                    if (result <= 0) {
+                        log_debug("Tuner %d query failed, stopping probe", i);
+                        break;
+                    }
+                    tuner_count = i + 1;
+                    log_debug("Tuner %d responded successfully", i);
+                }
+                
+                log_debug("Direct connection determined %d tuners", tuner_count);
+                
+                if (tuner_count > 0) {
+                    // Add all tuners to the list
+                    bool is_legacy = false;  // Assume non-legacy for direct connections
+                    
+                    for (int i = 0; i < tuner_count && total_tuner_count < MAX_TUNERS_TOTAL; i++) {
+                        tuners[total_tuner_count].device_id = device_id;
+                        strcpy(tuners[total_tuner_count].ip_str, ip_str);
+                        tuners[total_tuner_count].tuner_index = i;
+                        tuners[total_tuner_count].total_tuners_on_device = tuner_count;
+                        tuners[total_tuner_count].is_legacy = is_legacy;
+                        log_debug("  Added tuner %d: %08X-%d (%s) via direct connection", 
+                                  total_tuner_count, device_id, i, ip_str);
+                        total_tuner_count++;
+                    }
+                } else {
+                    log_debug("WARNING: Device responded but no tuners found");
+                }
+            } else {
+                log_debug("ERROR: Device connection created but device did not respond");
+            }
+            
+            hdhomerun_device_destroy(test_hd);
+        } else {
+            log_debug("ERROR: Failed to create direct device connection");
+        }
+        
+        log_debug("Direct connection attempt complete. Total tuners: %d", total_tuner_count);
+    }
+    
     clear();
     refresh();
     return total_tuner_count;
@@ -260,6 +404,7 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
     
     if (!hd || !tuner_info) {
         mvwprintw(win, 1, 2, "No Tuner Selected");
+        log_debug("draw_status_pane: No device or tuner info");
         return 0;
     }
 
@@ -273,11 +418,15 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
     int total_content_lines = 0;
     int y = 2; // Start drawing at line 2
 
-    if (hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status) > 0) {
+    log_debug("draw_status_pane: Getting tuner status for %08X-%d", tuner_info->device_id, tuner_info->tuner_index);
+    int status_result = hdhomerun_device_get_tuner_status(hd, &raw_status_str, &status);
+    log_debug("draw_status_pane: get_tuner_status returned %d", status_result);
+    if (status_result > 0) {
         long bps = parse_status_value(raw_status_str, "bps=");
         long pps = parse_status_value(raw_status_str, "pps=");
         long rssi = parse_db_value(raw_status_str, "ss=");
         long snr = parse_db_value(raw_status_str, "snq=");
+        log_debug("draw_status_pane: Channel=%s, Lock=%s, bps=%ld, pps=%ld", status.channel, status.lock_str, bps, pps);
 
         total_content_lines = 11; // Base number of lines for the top section
 
@@ -345,14 +494,20 @@ int draw_status_pane(WINDOW *win, struct hdhomerun_device_t *hd, struct unified_
 
         struct hdhomerun_tuner_vstatus_t vstatus;
         char *vstatus_str;
-        if (hdhomerun_device_get_tuner_vstatus(hd, &vstatus_str, &vstatus) > 0 && strlen(vstatus.vchannel) > 0) {
+        log_debug("draw_status_pane: Getting vstatus");
+        int vstatus_result = hdhomerun_device_get_tuner_vstatus(hd, &vstatus_str, &vstatus);
+        log_debug("draw_status_pane: get_tuner_vstatus returned %d", vstatus_result);
+        if (vstatus_result > 0 && strlen(vstatus.vchannel) > 0) {
             total_content_lines += 2;
             if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "Virtual Channel: %s", vstatus.vchannel); } y++;
             if (y - scroll_offset > 0) { print_line_in_box(win, y - scroll_offset, 2, "Name: %s", vstatus.name); } y++;
         }
         
         char *streaminfo_prog;
-        if (hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_prog) > 0) {
+        log_debug("draw_status_pane: Getting streaminfo");
+        int streaminfo_result = hdhomerun_device_get_tuner_streaminfo(hd, &streaminfo_prog);
+        log_debug("draw_status_pane: get_tuner_streaminfo returned %d", streaminfo_result);
+        if (streaminfo_result > 0) {
             char *programs[MAX_PROGRAMS];
             int program_count = 0;
             char *streaminfo_copy = strdup(streaminfo_prog);
@@ -494,7 +649,14 @@ int compare_plps(const void *a, const void *b) {
 void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *list) {
     list->count = 0;
     char *map_str;
-    if (hdhomerun_device_get_tuner_channelmap(hd, &map_str) <= 0) return;
+    log_debug("populate_channel_list: Getting channel map");
+    int result = hdhomerun_device_get_tuner_channelmap(hd, &map_str);
+    log_debug("populate_channel_list: get_tuner_channelmap returned %d", result);
+    if (result <= 0) {
+        log_debug("populate_channel_list: Failed to get channel map");
+        return;
+    }
+    log_debug("populate_channel_list: Channel map: %s", map_str);
 
     char *map_copy = strdup(map_str);
     if (!map_copy) return;
@@ -508,6 +670,7 @@ void populate_channel_list(struct hdhomerun_device_t *hd, struct channel_list *l
     }
     free(map_copy);
     if (list->count > 0) qsort(list->channels, list->count, sizeof(unsigned int), compare_channels);
+    log_debug("populate_channel_list: Populated %d channels", list->count);
 }
 
 /*
@@ -1337,17 +1500,31 @@ int main_loop() {
                 if (hd) hdhomerun_device_destroy(hd);
                 char device_id_str[16];
                 sprintf(device_id_str, "%08X", selected_tuner->device_id);
-                hd = hdhomerun_device_create_from_str(device_id_str, NULL);
+                log_debug("Creating device connection: ID=%s, IP=%s", 
+                          device_id_str, selected_tuner->ip_str);
+                // Use IP address for connection to support remote/Layer 3 connections
+                // The library can work with either device ID or IP, but IP is required
+                // when the device is not on the same broadcast domain
+                hd = hdhomerun_device_create_from_str(selected_tuner->ip_str, NULL);
+                if (hd) {
+                    log_debug("Device connection created successfully using IP: %s", selected_tuner->ip_str);
+                } else {
+                    log_debug("ERROR: Failed to create device connection with IP: %s", selected_tuner->ip_str);
+                }
                 current_device_id = selected_tuner->device_id;
                 status_scroll_offset = 0;
                 tuner_changed = true;
             }
             if (hd) {
-                hdhomerun_device_set_tuner(hd, selected_tuner->tuner_index);
+                log_debug("main_loop: Setting tuner to index %d", selected_tuner->tuner_index);
+                int set_result = hdhomerun_device_set_tuner(hd, selected_tuner->tuner_index);
+                log_debug("main_loop: set_tuner returned %d", set_result);
                 if (chan_list.count == 0 || tuner_changed) {
                     populate_channel_list(hd, &chan_list);
                     status_scroll_offset = 0;
                 }
+            } else {
+                log_debug("main_loop: WARNING - hd is NULL after connection attempt");
             }
         }
         
@@ -1454,6 +1631,7 @@ int main_loop() {
                 return 0;
 
             case 'r':
+                log_debug("Refresh: User requested device list refresh");
                 if (vlc_pid > 0) { 
                     kill(vlc_pid, SIGTERM); 
                     waitpid(vlc_pid, NULL, 0); 
@@ -1463,6 +1641,7 @@ int main_loop() {
                 if (hd) { hdhomerun_device_destroy(hd); hd = NULL; current_device_id = 0; }
                 chan_list.count = 0; status_scroll_offset = 0;
                 total_tuners = discover_and_build_tuner_list(tuners);
+                log_debug("Refresh: Discovered %d tuners", total_tuners);
                 highlight = 0;
                 if (total_tuners == 0) {
                     delwin(tuner_win); delwin(status_win);
@@ -1488,8 +1667,14 @@ int main_loop() {
 
             case 'v':
                 if (!hd) break;
+                log_debug("VLC: Starting VLC stream for tuner %08X-%d", tuners[highlight].device_id, tuners[highlight].tuner_index);
                 if (persistent_message) free(persistent_message);
                 persistent_message = stream_to_vlc(hd, status_win, &vlc_pid, &tuners[highlight]);
+                if (vlc_pid > 0) {
+                    log_debug("VLC: Stream started with PID %d", vlc_pid);
+                } else {
+                    log_debug("VLC: Stream failed to start");
+                }
                 break;
 
             case '+':
@@ -1547,6 +1732,7 @@ int main_loop() {
 
                         char tune_str[64];
                         sprintf(tune_str, "auto:%u", new_channel);
+                        log_debug("Seek: Tuning to channel %u", new_channel);
                         hdhomerun_device_set_tuner_channel(hd, tune_str);
                         status_scroll_offset = 0;
                         
@@ -1629,7 +1815,9 @@ int main_loop() {
                     }
                     char tune_str[64];
                     sprintf(tune_str, "auto:%u", new_channel);
-                    hdhomerun_device_set_tuner_channel(hd, tune_str);
+                    log_debug("main_loop: Tuning to channel %u (tune_str: %s)", new_channel, tune_str);
+                    int tune_result = hdhomerun_device_set_tuner_channel(hd, tune_str);
+                    log_debug("main_loop: set_tuner_channel returned %d", tune_result);
                     status_scroll_offset = 0;
                 }
                 break;
@@ -1675,7 +1863,9 @@ int main_loop() {
                     if (strlen(channel_str) > 0) {
                         char full_tune_str[100];
                         sprintf(full_tune_str, "auto:%s", channel_str);
-                        hdhomerun_device_set_tuner_channel(hd, full_tune_str);
+                        log_debug("Manual tune: channel_str=%s, full_tune_str=%s", channel_str, full_tune_str);
+                        int tune_result = hdhomerun_device_set_tuner_channel(hd, full_tune_str);
+                        log_debug("Manual tune: set_tuner_channel returned %d", tune_result);
                         struct hdhomerun_tuner_status_t lock_status;
                         hdhomerun_device_wait_for_lock(hd, &lock_status);
                         status_scroll_offset = 0;
@@ -1860,7 +2050,52 @@ int main_loop() {
  * main
  * Entry point of the application.
  */
-int main() {
+void print_usage(const char *program_name) {
+    printf("HDHomeRun TUI v%s\n", TUI_VERSION);
+    printf("Usage: %s [options]\n", program_name);
+    printf("\nOptions:\n");
+    printf("  -d, --device <id|ip>    Specify HDHomeRun device by ID or IP address\n");
+    printf("                          Example: -d 12345678 or -d 192.168.1.100\n");
+    printf("  -v, --verbose           Enable verbose debug logging to hdhomerun_tui.log\n");
+    printf("  -h, --help              Show this help message\n");
+    printf("\nIf no device is specified, all available devices will be discovered.\n");
+}
+
+int main(int argc, char *argv[]) {
+    // Parse command line arguments
+    int opt;
+    static struct option long_options[] = {
+        {"device", required_argument, 0, 'd'},
+        {"verbose", no_argument, 0, 'v'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    while ((opt = getopt_long(argc, argv, "d:vh", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'd':
+                target_device = optarg;
+                break;
+            case 'v':
+                verbose_mode = true;
+                debug_log_file = fopen("hdhomerun_tui.log", "a");
+                if (debug_log_file) {
+                    log_debug("=== HDHomeRun TUI Debug Log Started ===");
+                    log_debug("Version: %s", TUI_VERSION);
+                    if (target_device) {
+                        log_debug("Target device: %s", target_device);
+                    }
+                }
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+
     initscr();
     clear();
     noecho();
@@ -1888,7 +2123,11 @@ int main() {
         }
         // If result is 1 (no devices), show message and wait for input
         clear();
-        mvprintw(LINES / 2, (COLS - 28) / 2, "No HDHomeRun devices found.");
+        if (target_device) {
+            mvprintw(LINES / 2, (COLS - 40) / 2, "HDHomeRun device '%s' not found.", target_device);
+        } else {
+            mvprintw(LINES / 2, (COLS - 28) / 2, "No HDHomeRun devices found.");
+        }
         mvprintw(LINES / 2 + 2, (COLS - 40) / 2, "Press 'r' to refresh, or 'q' to quit.");
         refresh();
         nodelay(stdscr, FALSE);
@@ -1898,6 +2137,11 @@ int main() {
         }
     }
 
+    log_debug("=== HDHomeRun TUI Exiting ===");
+    if (debug_log_file) {
+        fclose(debug_log_file);
+        debug_log_file = NULL;
+    }
     endwin();
     return 0;
 }
